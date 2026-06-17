@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "glycoprotein-tilt-analysis"
+version = "0.1.0"
+description = "Calculate tilt angles of glycoproteins relative to an irregular membrane."
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "typer",
+    "mrcfile",
+    "starfile",
+    "scipy",
+    "numpy",
+    "pandas"
+]
+
+[project.scripts]
+#creates a terminal command called 'gca' pointing to the 'app' variable in cli.py
+gca = "gca.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: glycoprotein-tilt-analysis
+Version: 0.1.0
+Summary: Calculate tilt angles of glycoproteins relative to an irregular membrane.
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: typer
+Requires-Dist: mrcfile
+Requires-Dist: starfile
+Requires-Dist: scipy
+Requires-Dist: numpy
+Requires-Dist: pandas

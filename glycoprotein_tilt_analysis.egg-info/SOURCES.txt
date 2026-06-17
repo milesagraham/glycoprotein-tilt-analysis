@@ -1,0 +1,8 @@
+README.md
+pyproject.toml
+glycoprotein_tilt_analysis.egg-info/PKG-INFO
+glycoprotein_tilt_analysis.egg-info/SOURCES.txt
+glycoprotein_tilt_analysis.egg-info/dependency_links.txt
+glycoprotein_tilt_analysis.egg-info/entry_points.txt
+glycoprotein_tilt_analysis.egg-info/requires.txt
+glycoprotein_tilt_analysis.egg-info/top_level.txt
