@@ -81,14 +81,23 @@ def calculate_patch_normal(patch_coords: np.ndarray) -> np.ndarray:
     return normal / np.linalg.norm(normal)
 
 
-def calculate_tilt_angle(particle_vector: np.ndarray, membrane_normal: np.ndarray) -> float:
-    """Calculates the angle between the particle and the outward-facing membrane normal."""
+def resolve_normal_sign(membrane_normal: np.ndarray, patch_coords: np.ndarray, particle_position: np.ndarray) -> np.ndarray:
+    """Orients the sign-ambiguous SVD normal using the particle's position relative to its local patch."""
 
-    # Making sure membrane vector orientation isn't flipped relative to glycoprotein
-    # If the dot product is negative, then the vectors point in opposite directions
-    if np.dot(particle_vector, membrane_normal) < 0:
-        #if so then flip it
+    #vector from the local patch's centroid to the particle's own coordinate - this points "outward"
+    #from the membrane toward wherever the particle actually is, independent of its Euler angles
+    patch_centroid = np.mean(patch_coords, axis=0)
+    centroid_to_particle = particle_position - patch_centroid
+
+    #flip the normal if it points away from the particle rather than toward it
+    if np.dot(membrane_normal, centroid_to_particle) < 0:
         membrane_normal = -membrane_normal
+
+    return membrane_normal
+
+
+def calculate_tilt_angle(particle_vector: np.ndarray, membrane_normal: np.ndarray) -> float:
+    """Calculates the angle between the particle's orientation vector and the (already sign-resolved) membrane normal."""
 
     #For two unit vectors, the dot product is exactly equal to the cosine of the angle between them:
     #our vectors were already normalised earlier which is why we can do this
@@ -134,6 +143,10 @@ def compute_all_tilts(
         #put the xyz coordinates for this patch through our function to get the membrane normal
         patch_coords = membrane_coords[patch_indices]
         membrane_normal = calculate_patch_normal(patch_coords)
+
+        #resolve which way the normal should point using this particle's own position relative to
+        #its local patch - not its orientation, which is the thing we're about to measure against it
+        membrane_normal = resolve_normal_sign(membrane_normal, patch_coords, particle_coords[i])
 
         #put the eulers from the star file through our function to get the particle vector)
         rot, tilt, psi = eulers[i]
