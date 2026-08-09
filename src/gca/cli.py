@@ -84,9 +84,15 @@ def calculate_patch_normal(patch_coords: np.ndarray) -> np.ndarray:
 def resolve_normal_sign(membrane_normal: np.ndarray, patch_coords: np.ndarray, particle_position: np.ndarray) -> np.ndarray:
     """Orients the sign-ambiguous SVD normal using the particle's position relative to its local patch."""
 
-    #vector from the local patch's centroid to the particle's own coordinate - this points "outward"
-    #from the membrane toward wherever the particle actually is, independent of its Euler angles
-    patch_centroid = np.mean(patch_coords, axis=0)
+    #weight patch points by inverse distance to the particle so nearby points (which best represent
+    #the membrane right under the particle) dominate the centroid, and distant patch points - which on
+    #a curved/asymmetric patch can otherwise drag the centroid off to one side - barely count
+    distances = np.linalg.norm(patch_coords - particle_position, axis=1)
+    weights = 1.0 / (distances + 1e-6)
+    patch_centroid = np.average(patch_coords, axis=0, weights=weights)
+
+    #vector from the (now distance-weighted) patch centroid to the particle's own coordinate - this
+    #points "outward" from the membrane toward wherever the particle actually is
     centroid_to_particle = particle_position - patch_centroid
 
     #flip the normal if it points away from the particle rather than toward it
@@ -116,14 +122,15 @@ def compute_all_tilts(
     particle_coords: np.ndarray,
     eulers: np.ndarray,
     membrane_coords: np.ndarray,
-    patch_radius: float
+    patch_radius: float,
+    distance_to_membrane_threshold: float
 ) -> List[float]:
     """Runs the maths for all the particles."""
     #maps the segmentation mask into a a highly optimised search index so it can find the nearest membrane a lot quicker.
     tree = cKDTree(membrane_coords)
 
-    #finds the single nearest membrane voxel for each particle
-    _, indices = tree.query(particle_coords)
+    #finds the single nearest membrane voxel for each particle, and how far away it is
+    nearest_membrane_dist, indices = tree.query(particle_coords)
     closest_membrane_points = membrane_coords[indices]
 
     #extract a sphere around these points which will be used for finding the membrane normal
@@ -134,6 +141,13 @@ def compute_all_tilts(
     #number every item in the patch indices list using enumerate
     #i catches the item number (starting from 0) and patch_indices catches the corresponding data (list of membrane voxels)
     for i, patch_indices in enumerate(patch_indices_list):
+        #plausibility check: a particle further from the membrane than this threshold is a
+        #distance-based outlier (mispick, wrong particle, etc) rather than a real membrane
+        #protein - flag with NaN instead of computing a tilt for it
+        if nearest_membrane_dist[i] > distance_to_membrane_threshold:
+            calculated_angles.append(np.nan)
+            continue
+
         #here we might clean up some poor particle picks that don't have membrane within the assigned radius or ones which are near a non-segmented membrane (e.g. due to missing wedge etc).
         #instead of crashing we end up with a NaN for these, so they can be filtered out in the analysis.
         if len(patch_indices) < 3:
@@ -168,6 +182,12 @@ def analyze_tilts(
         float, typer.Option("--particles_apx", help="Particle coordinate pixel size in Angstroms/pixel")],
     patch_radius: Annotated[
         float, typer.Option("--patch_radius", help="Radius in Angstroms to extract local membrane patch")] = 150.0,
+    distance_to_membrane_threshold: Annotated[
+        float, typer.Option("--distance-to-membrane-threshold",
+                             help="Maximum plausible distance in Angstroms between a particle and the nearest "
+                                  "segmented membrane point (roughly the glycoprotein's ectodomain height) - "
+                                  "particles further than this are flagged as distance-based outliers. Tune "
+                                  "this to your own structure/dataset")] = 85.0,
     output: Annotated[Path, typer.Option("--output", "-o", help="Output STAR file to save results")] = Path(
         "tilts_output.star")
 ):
@@ -196,6 +216,11 @@ def analyze_tilts(
         typer.echo(f"Input Error: --patch_radius must be a positive number, got {patch_radius}", err=True)
         raise typer.Exit(code=1)
 
+    if distance_to_membrane_threshold <= 0:
+        typer.echo(f"Input Error: --distance-to-membrane-threshold must be a positive number, "
+                   f"got {distance_to_membrane_threshold}", err=True)
+        raise typer.Exit(code=1)
+
     #attempts to load the segmentation file and star and raises an error if it can't
     try:
         typer.echo(f"Loading segmentation from: {seg_file}")
@@ -217,16 +242,21 @@ def analyze_tilts(
     eulers = df[['rlnAngleRot', 'rlnAngleTilt', 'rlnAnglePsi']].to_numpy()
     #figure out how many voxels the membrane extraction from our seg volume needs to be
     patch_radius_vox = patch_radius / seg_apx
+    #same conversion for the plausibility distance threshold
+    distance_to_membrane_threshold_vox = distance_to_membrane_threshold / seg_apx
 
     typer.echo(f"Scaled particle coordinates (Factor: {scaling_factor:.4f}).")
     typer.echo(f"Local patch radius set to {patch_radius_vox:.2f} voxels ({patch_radius} A).")
+    typer.echo(f"Distance-to-membrane plausibility threshold set to {distance_to_membrane_threshold_vox:.2f} "
+               f"voxels ({distance_to_membrane_threshold} A).")
 
     typer.echo("Building KD-Tree, extracting patches, and calculating normals...")
     calculated_angles = compute_all_tilts(
         particle_coords=particle_coords_vox,
         eulers=eulers,
         membrane_coords=membrane_coords_vox,
-        patch_radius=patch_radius_vox
+        patch_radius=patch_radius_vox,
+        distance_to_membrane_threshold=distance_to_membrane_threshold_vox
     )
 
     #df is the same object as the relevant entry in df_dict (or df_dict itself, if the STAR file
