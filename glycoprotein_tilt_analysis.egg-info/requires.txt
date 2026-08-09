@@ -1,6 +1,0 @@
-typer
-mrcfile
-starfile
-scipy
-numpy
-pandas
