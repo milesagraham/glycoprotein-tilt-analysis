@@ -162,6 +162,27 @@ def analyze_tilts(
     Load data, map spaces, run PCA on local membrane patches, and calculate particle tilt angles.
     """
 
+    #check inputs exist and are sane before attempting to load/process anything
+    if not seg_file.exists():
+        typer.echo(f"Input Error: Segmentation file not found: {seg_file}", err=True)
+        raise typer.Exit(code=1)
+
+    if not star_file.exists():
+        typer.echo(f"Input Error: STAR file not found: {star_file}", err=True)
+        raise typer.Exit(code=1)
+
+    if seg_apx <= 0:
+        typer.echo(f"Input Error: --seg_apx must be a positive number, got {seg_apx}", err=True)
+        raise typer.Exit(code=1)
+
+    if particles_apx <= 0:
+        typer.echo(f"Input Error: --particles_apx must be a positive number, got {particles_apx}", err=True)
+        raise typer.Exit(code=1)
+
+    if patch_radius <= 0:
+        typer.echo(f"Input Error: --patch_radius must be a positive number, got {patch_radius}", err=True)
+        raise typer.Exit(code=1)
+
     #attempts to load the segmentation file and star and raises an error if it can't
     try:
         typer.echo(f"Loading segmentation from: {seg_file}")
