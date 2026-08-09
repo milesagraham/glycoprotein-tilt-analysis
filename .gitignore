@@ -36,3 +36,6 @@ Thumbs.db
 # Editors
 .idea/
 .vscode/
+
+# Local test data (large/real-world files, kept out of git)
+test_materials/

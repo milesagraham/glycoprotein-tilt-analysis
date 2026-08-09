@@ -190,7 +190,7 @@ def analyze_tilts(
         typer.echo(f"Found {len(membrane_coords_vox)} membrane voxels.")
 
         typer.echo(f"Loading coordinates from: {star_file}")
-        df, df_dict, block_name = load_star_data(star_file)
+        df, df_dict, _ = load_star_data(star_file)
         typer.echo(f"Loaded {len(df)} particles.")
 
     except (ValueError, KeyError) as e:
@@ -216,13 +216,11 @@ def analyze_tilts(
         patch_radius=patch_radius_vox
     )
 
-    #save the tilt angle to the star file
+    #df is the same object as the relevant entry in df_dict (or df_dict itself, if the STAR file
+    #had no named blocks), so this mutation is already reflected in df_dict - nothing else to write back
     df['rlnMembraneTiltAngle'] = calculated_angles
-    output_data = df_dict
-    if block_name:
-        output_data[block_name] = df
 
-    starfile.write(output_data, output, overwrite=True)
+    starfile.write(df_dict, output, overwrite=True)
     typer.echo(f"Success! Analysis complete. Output saved to: {output}")
 
 if __name__ == "__main__":
