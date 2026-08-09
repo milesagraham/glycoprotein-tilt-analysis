@@ -14,7 +14,8 @@ dependencies = [
     "starfile",
     "scipy",
     "numpy",
-    "pandas"
+    "pandas",
+    "typing_extensions"
 ]
 
 [project.scripts]
