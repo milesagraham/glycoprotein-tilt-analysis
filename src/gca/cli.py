@@ -228,7 +228,7 @@ def analyze_tilts(
         typer.echo(f"Found {len(membrane_coords_vox)} membrane voxels.")
 
         typer.echo(f"Loading coordinates from: {star_file}")
-        df, df_dict, _ = load_star_data(star_file)
+        df, df_dict, block_name = load_star_data(star_file)
         typer.echo(f"Loaded {len(df)} particles.")
 
     except (ValueError, KeyError) as e:
@@ -265,6 +265,15 @@ def analyze_tilts(
 
     starfile.write(df_dict, output, overwrite=True)
     typer.echo(f"Success! Analysis complete. Output saved to: {output}")
+
+    #ArtiaX (and similar tools) can't use a NaN column as a selection criterion, so also write a
+    #second STAR file with the outlier/unresolved rows dropped entirely - directly selectable as-is
+    accepted_df = df[df['rlnMembraneTiltAngle'].notna()].copy()
+    accepted_data = {**df_dict, block_name: accepted_df} if block_name is not None else accepted_df
+    accepted_output = output.with_name(f"{output.stem}_accepted_coordinates{output.suffix}")
+
+    starfile.write(accepted_data, accepted_output, overwrite=True)
+    typer.echo(f"Accepted-only particles ({len(accepted_df)}/{len(df)}) saved to: {accepted_output}")
 
 if __name__ == "__main__":
     app()
