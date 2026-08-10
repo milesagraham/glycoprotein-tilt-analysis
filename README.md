@@ -54,12 +54,10 @@ Two STAR files are written:
 
 ## Example
 
-The image above is particle idx=51 from a real tomogram (shown here at a fixed
+The image above is particle from a real tomogram (shown here at a fixed
 100 Å patch radius for a clearer view of the membrane; the tool's own adaptive
 selection would typically use a smaller radius for this particle), viewed
 side-on to the fitted normal: the grey cloud is its local membrane patch, the
 black cross is the nearest membrane point, the blue arrow is the fitted
 membrane normal, and the red arrow is the particle's own orientation — the
-angle between them (here, 14.6°) is what gets reported. Viewing side-on like
-this makes it easy to sanity-check that the normal is actually perpendicular
-to the local membrane surface.
+angle between them (here, 14.6°) is what gets reported. 
