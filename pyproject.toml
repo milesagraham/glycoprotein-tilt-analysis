@@ -19,8 +19,8 @@ dependencies = [
 ]
 
 [project.scripts]
-#creates a terminal command called 'gca' pointing to the 'app' variable in cli.py
-gca = "gca.cli:app"
+#creates a terminal command called 'gta' pointing to the 'app' variable in cli.py
+gta = "gta.cli:app"
 
 [tool.setuptools.packages.find]
 where = ["src"]

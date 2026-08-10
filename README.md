@@ -1,4 +1,4 @@
-# GCA: Glycoprotein Tilt Analysis
+# GTA: Glycoprotein Tilt Analysis
 
 A command-line tool for calculating the tilt angle of viral surface glycoproteins
 relative to an irregularly segmented membrane, from a RELION-style STAR file of
@@ -16,12 +16,12 @@ between that normal and the particle's own orientation.
 pip install -e .
 ```
 
-This installs the `gca` command and its dependencies (`typer`, `mrcfile`, `starfile`, `numpy`, `scipy`, `pandas`).
+This installs the `gta` command and its dependencies (`typer`, `mrcfile`, `starfile`, `numpy`, `scipy`, `pandas`).
 
 ## Usage
 
 ```bash
-gca segmentation.mrc particles.star -11-seg_apx 7.456 --particles_apx 3.728
+gta segmentation.mrc particles.star -11-seg_apx 7.456 --particles_apx 3.728
 ```
 
 `seg_file` and `star_file` are positional; pixel sizes are required since the
@@ -39,7 +39,7 @@ else has a sensible default.
 | `--angular-gap-threshold` | 40° | Particles whose local patch has a wide empty angular sector (segmentation edge, missing-wedge dropout) are flagged as unreliable. |
 | `--output` / `-o` | `tilts_output.star` | Output path. |
 
-Run `gca --help` for the full list.
+Run `gta --help` for the full list.
 
 ## Output
 

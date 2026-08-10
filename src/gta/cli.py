@@ -8,7 +8,7 @@ from scipy.spatial import cKDTree
 from typing_extensions import Annotated
 from typing import Tuple, List, Any, Optional
 
-app = typer.Typer(help="GCA: Calculate tilt angles of glycoproteins relative to an irregular membrane.")
+app = typer.Typer(help="GTA: Calculate tilt angles of glycoproteins relative to an irregular membrane.")
 
 #internal tuning for adaptive patch radius search - validated against real data rather than exposed
 #as CLI options, to keep the user-facing interface focused on just min/max radius and on/off

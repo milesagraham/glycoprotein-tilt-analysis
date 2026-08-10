@@ -1,5 +1,5 @@
 """
-GCA: Glycoprotein Tilt Analysis
+GTA: Glycoprotein Tilt Analysis
 A command-line tool for calculating the tilt angles of viral surface
 glycoproteins relative to irregularly segmented membranes.
 """
