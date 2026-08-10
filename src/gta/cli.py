@@ -255,6 +255,7 @@ def compute_all_tilts(
     membrane_coords: np.ndarray,
     distance_to_membrane_threshold: float,
     angular_gap_threshold: float,
+    max_tilt_angle: float,
     adaptive_patch_radius: bool,
     patch_radius: float,
     min_patch_radius: float,
@@ -353,7 +354,15 @@ def compute_all_tilts(
 
         #calculate the tilt angle between these two and add to a final list
         angle_deg = calculate_tilt_angle(particle_vector, membrane_normal)
-        calculated_angles.append(angle_deg)
+
+        #plausibility check: a real membrane-anchored glycoprotein can't tilt anywhere near 90
+        #degrees without its ectodomain clashing into the membrane - particles this tilted are
+        #typically junk picks (e.g. sitting on segmented ice contamination rather than membrane)
+        #rather than real, if unusual, biology. This is a different kind of check to the others
+        #above: it's about whether the *result* looks biologically plausible, not whether the
+        #patch itself was good enough to trust - so the membrane geometry (curvature) is still
+        #reported below even when the angle itself gets excluded
+        calculated_angles.append(angle_deg if angle_deg <= max_tilt_angle else np.nan)
 
         #sign/size of the local curvature relative to the particle - negative (convex, particle
         #outside) is expected; positive (concave, particle inside the membrane) is worth flagging
@@ -400,6 +409,13 @@ def analyze_tilts(
                                   "(e.g. from a segmentation fragment edge or missing-wedge dropout) - particles "
                                   "whose patch has a wider empty angular sector than this are flagged as "
                                   "coverage-based outliers")] = 40.0,
+    max_tilt_angle: Annotated[
+        float, typer.Option("--max-tilt-angle",
+                             help="Maximum biologically plausible tilt angle in degrees - a real membrane-anchored "
+                                  "glycoprotein can't tilt close to 90 degrees without its ectodomain clashing "
+                                  "into the membrane, so particles tilted more than this are flagged as implausible "
+                                  "(typically junk picks, e.g. on segmented ice contamination). Tune this to your "
+                                  "own structure/dataset")] = 80.0,
     output: Annotated[Path, typer.Option("--output", "-o", help="Output STAR file to save results")] = Path(
         "tilts_output.star")
 ):
@@ -447,6 +463,11 @@ def analyze_tilts(
                    f"got {angular_gap_threshold}", err=True)
         raise typer.Exit(code=1)
 
+    if not 0 < max_tilt_angle <= 180:
+        typer.echo(f"Input Error: --max-tilt-angle must be a number between 0 and 180, "
+                   f"got {max_tilt_angle}", err=True)
+        raise typer.Exit(code=1)
+
     #attempts to load the segmentation file and star and raises an error if it can't
     try:
         typer.echo(f"Loading segmentation from: {seg_file}")
@@ -484,6 +505,7 @@ def analyze_tilts(
     typer.echo(f"Distance-to-membrane plausibility threshold set to {distance_to_membrane_threshold_vox:.2f} "
                f"voxels ({distance_to_membrane_threshold} A).")
     typer.echo(f"Angular coverage gap threshold set to {angular_gap_threshold} degrees.")
+    typer.echo(f"Maximum plausible tilt angle set to {max_tilt_angle} degrees.")
 
     typer.echo("Building KD-Tree, extracting patches, and calculating normals...")
     calculated_angles, calculated_curvatures, calculated_gaps, calculated_radii = compute_all_tilts(
@@ -492,6 +514,7 @@ def analyze_tilts(
         membrane_coords=membrane_coords_vox,
         distance_to_membrane_threshold=distance_to_membrane_threshold_vox,
         angular_gap_threshold=angular_gap_threshold,
+        max_tilt_angle=max_tilt_angle,
         adaptive_patch_radius=adaptive_patch_radius,
         patch_radius=patch_radius_vox,
         min_patch_radius=min_patch_radius_vox,
@@ -501,6 +524,9 @@ def analyze_tilts(
 
     #df is the same object as the relevant entry in df_dict (or df_dict itself, if the STAR file
     #had no named blocks), so this mutation is already reflected in df_dict - nothing else to write back
+    #row position in the ORIGINAL input STAR file - lets a specific particle (e.g. one flagged during
+    #analysis) be found again later, in this output or in ArtiaX, even after rows have been filtered
+    df['rlnOriginalIndex'] = np.arange(len(df))
     df['rlnMembraneTiltAngle'] = calculated_angles
     #negative = convex, membrane bulges toward the particle (expected); positive = concave, membrane
     #wraps around the particle (implausible pick) - exposed as its own column so it can be inspected
