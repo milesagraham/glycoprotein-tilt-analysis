@@ -42,6 +42,13 @@ BOX_A = 300.0
 BOX_PIXELS = 170
 ARROW_LEN_A = 70.0
 
+#wider single-slice context view (report Fig. 10) - shows where on the virus/vesicle a pick sits,
+#not just its immediate membrane patch. Sampled close to the tomogram's native pixel size rather
+#than oversampled, since there's no real benefit to interpolating finer than the data at this scale.
+CONTEXT_BOX_A = 2000.0
+CONTEXT_BOX_PIXELS = 220
+CONTEXT_ARROW_LEN_A = 300.0
+
 
 def discover_tomogram_sets(data_dir: Path) -> List[dict]:
     """Finds tomogram/segmentation/starfile triples that share an exact filename stem across the
@@ -115,6 +122,28 @@ def _save_review_panel(
     _draw_panel(axes[2], img_ortho, pv_ortho, np.array([0, 1]), "side - orthogonal (90° around normal)")
     fig.tight_layout(pad=0.6)
     fig.savefig(path, dpi=105, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.08)
+    plt.close(fig)
+
+
+def _save_context_panel(path: Path, img: np.ndarray, particle_2d: np.ndarray) -> None:
+    """Wider single-slice context view (report Fig. 10): same normal-referenced orientation as the
+    close-up 'true angle' panel, just zoomed out enough to show the surrounding virus/vesicle."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(figsize=(4.6, 4.6), facecolor='#14191a')
+    vmin, vmax = np.percentile(img, [1, 99])
+    ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
+              extent=[-CONTEXT_BOX_A / 2, CONTEXT_BOX_A / 2, -CONTEXT_BOX_A / 2, CONTEXT_BOX_A / 2])
+    ax.scatter(0, 0, c='#f9a825', s=140, marker='+', linewidth=2.6, zorder=5)
+    ax.annotate('', xy=tuple(particle_2d * CONTEXT_ARROW_LEN_A), xytext=(0, 0),
+                arrowprops=dict(arrowstyle='-|>', color='#d1495b', linewidth=2.4))
+    ax.set_xticks([]); ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    fig.tight_layout(pad=0)
+    fig.savefig(path, dpi=105, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.02)
     plt.close(fig)
 
 
@@ -202,6 +231,10 @@ def analyze_tomogram_for_review(
     grid_1d = np.linspace(-half_width_vox, half_width_vox, BOX_PIXELS)
     grid_b, grid_a = np.meshgrid(grid_1d, grid_1d, indexing='ij')
 
+    context_half_width_vox = (CONTEXT_BOX_A / 2) / seg_apx
+    context_grid_1d = np.linspace(-context_half_width_vox, context_half_width_vox, CONTEXT_BOX_PIXELS)
+    context_grid_b, context_grid_a = np.meshgrid(context_grid_1d, context_grid_1d, indexing='ij')
+
     stem_cache_dir = cache_dir / stem
     stem_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -225,11 +258,16 @@ def analyze_tomogram_for_review(
         filename = f"idx{rec['idx']}.png"
         _save_review_panel(stem_cache_dir / filename, img_top, img_true, img_ortho, pv_top, pv_true, pv_ortho)
 
+        context_img = _extract_slice(tomo, rec['pos'], h_axis, n_axis, context_grid_a, context_grid_b)
+        context_filename = f"idx{rec['idx']}_context.png"
+        _save_context_panel(stem_cache_dir / context_filename, context_img, pv_true)
+
         records.append(dict(
             key=f"{stem}:{rec['idx']}", stem=stem, idx=int(rec['idx']),
             tilt=round(float(rec['angle']), 2), lcc=rec['lccmax'],
             curvature=round(float(rec['curvature']), 4), gap=round(float(rec['gap']), 2),
             radius_A=round(float(rec['radius_A']), 1), image=f"/api/image/{stem}/{filename}",
+            context_image=f"/api/image/{stem}/{context_filename}",
         ))
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
@@ -332,11 +370,16 @@ INDEX_HTML = r"""<!doctype html>
   #imgwrap { position: relative; border: 3px solid var(--line); border-radius: 10px; overflow: hidden;
              transition: border-color 0.1s; line-height: 0; background: #14191a; }
   #imgwrap.acc { border-color: var(--teal); } #imgwrap.rej { border-color: var(--crimson); }
-  #img { max-height: 62vh; max-width: 80vw; display: block; }
+  #img { max-height: 62vh; max-width: 58vw; display: block; }
   #badge { position: absolute; top: 10px; right: 10px; padding: 3px 10px; border-radius: 5px;
            font-size: 12px; font-weight: 600; letter-spacing: 0.03em; display: none; }
   #badge.acc { display: block; background: var(--teal); color: #06201d; }
   #badge.rej { display: block; background: var(--crimson); color: #2a0508; }
+  #ctxcol { display: flex; flex-direction: column; align-items: center; gap: 8px; flex-shrink: 0; }
+  #ctxwrap { border: 2px solid var(--line); border-radius: 8px; overflow: hidden; line-height: 0;
+             background: #14191a; }
+  #ctximg { max-height: 46vh; max-width: 26vw; display: block; }
+  #ctxlabel { font-size: 11px; color: var(--ink-soft); letter-spacing: 0.05em; text-transform: uppercase; }
   #meta { width: 260px; font-size: 14px; line-height: 2.1; flex-shrink: 0; }
   #meta .row { display: flex; justify-content: space-between; border-bottom: 1px solid var(--line); padding: 2px 0; }
   #meta .label { color: var(--ink-soft); }
@@ -363,6 +406,10 @@ INDEX_HTML = r"""<!doctype html>
 <div id="progress-bar"><div id="progress-fill"></div></div>
 <main>
   <div id="imgwrap"><img id="img" src=""><div id="badge"></div></div>
+  <div id="ctxcol">
+    <div id="ctxwrap"><img id="ctximg" src=""></div>
+    <div id="ctxlabel">context &middot; 2000&thinsp;&Aring;</div>
+  </div>
   <div id="meta">
     <h2 id="m-title">-</h2>
     <div class="row"><span class="label">particle idx</span><span class="val" id="m-idx">-</span></div>
@@ -404,6 +451,7 @@ function render() {
   if (queue.length === 0) { document.getElementById('m-title').innerText = 'No particles to review.'; return; }
   const r = queue[idx];
   document.getElementById('img').src = r.image;
+  document.getElementById('ctximg').src = r.context_image;
   document.getElementById('m-title').innerText = r.stem;
   document.getElementById('m-idx').innerText = r.idx;
   document.getElementById('m-tilt').innerText = r.tilt.toFixed(1) + '°';
@@ -426,7 +474,10 @@ function render() {
 
 function prefetch() {
   for (let k = 1; k <= 3; k++) {
-    if (queue[idx + k]) { const im = new Image(); im.src = queue[idx + k].image; }
+    if (queue[idx + k]) {
+      const im = new Image(); im.src = queue[idx + k].image;
+      const ctxIm = new Image(); ctxIm.src = queue[idx + k].context_image;
+    }
   }
 }
 
