@@ -15,7 +15,9 @@ dependencies = [
     "scipy",
     "numpy",
     "pandas",
-    "typing_extensions"
+    "typing_extensions",
+    "flask",
+    "matplotlib"
 ]
 
 [project.scripts]
