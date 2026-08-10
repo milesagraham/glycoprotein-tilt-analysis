@@ -102,6 +102,65 @@ def resolve_normal_sign(membrane_normal: np.ndarray, patch_coords: np.ndarray, p
     return membrane_normal
 
 
+def build_tangent_frame(membrane_normal: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Builds an arbitrary orthonormal (u, v) basis perpendicular to the given normal."""
+    reference_axis = np.array([1.0, 0.0, 0.0]) if abs(membrane_normal[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u_axis = np.cross(membrane_normal, reference_axis)
+    u_axis /= np.linalg.norm(u_axis)
+    v_axis = np.cross(membrane_normal, u_axis)
+    return u_axis, v_axis
+
+
+def calculate_local_curvature(patch_coords: np.ndarray, anchor: np.ndarray, membrane_normal: np.ndarray) -> float:
+    """Fits a local quadratic surface to the patch to get the sign and rough size of its curvature.
+
+    membrane_normal must already point from the membrane toward the particle (i.e. resolve_normal_sign
+    has already been applied). A negative result means the membrane bulges toward the particle - convex,
+    particle on the outside, as expected. A positive result means the membrane wraps around the particle -
+    concave, particle on the inside - which shouldn't happen for a real glycoprotein pick and is worth
+    flagging. Validated on synthetic convex/concave test patches: a convex cap with the particle outside
+    gives a negative value, the identical cap with the particle on the concave side gives the exact
+    positive of that value, and a flat patch gives ~0.
+    """
+    u_axis, v_axis = build_tangent_frame(membrane_normal)
+
+    #express each patch point relative to the anchor in (u, v, height-along-normal) coordinates
+    relative_coords = patch_coords - anchor
+    u_coords = relative_coords @ u_axis
+    v_coords = relative_coords @ v_axis
+    height = relative_coords @ membrane_normal
+
+    #least-squares fit of height ~ D*u + E*v + A*u^2 + B*v^2 + C*u*v
+    design_matrix = np.column_stack([u_coords, v_coords, u_coords**2, v_coords**2, u_coords * v_coords])
+    coefficients, *_ = np.linalg.lstsq(design_matrix, height, rcond=None)
+    _, _, quad_u, quad_v, _ = coefficients
+
+    #A+B is the trace of the quadratic form, which doesn't depend on how (u, v) happened to be oriented
+    return quad_u + quad_v
+
+
+def calculate_angular_gap(patch_coords: np.ndarray, anchor: np.ndarray, membrane_normal: np.ndarray) -> float:
+    """Finds the widest empty angular sector around the anchor, viewed down the membrane normal.
+
+    A large gap means the patch has no coverage on one side - e.g. the particle sits near the edge of a
+    segmented membrane fragment, or in a missing-wedge dropout - which can bias the fitted normal. Checked
+    this against real data: particles with a consistently large gap across multiple patch radii turned out
+    to sit right at genuine fragment edges (confirmed by looking at a much wider context radius), while
+    particles with a small gap at the radius actually used for the analysis were reliable even when a
+    smaller radius alone made them look borderline.
+    """
+    u_axis, v_axis = build_tangent_frame(membrane_normal)
+
+    #angular position of each patch point around the anchor, in the tangent plane
+    relative_coords = patch_coords - anchor
+    angles = np.arctan2(relative_coords @ v_axis, relative_coords @ u_axis)
+
+    #sort the angles and find the single largest empty wedge between consecutive points (wrapping around)
+    sorted_angles = np.sort(angles)
+    gaps = np.diff(sorted_angles, append=sorted_angles[0] + 2 * np.pi)
+    return np.rad2deg(np.max(gaps))
+
+
 def calculate_tilt_angle(particle_vector: np.ndarray, membrane_normal: np.ndarray) -> float:
     """Calculates the angle between the particle's orientation vector and the (already sign-resolved) membrane normal."""
 
@@ -123,8 +182,9 @@ def compute_all_tilts(
     eulers: np.ndarray,
     membrane_coords: np.ndarray,
     patch_radius: float,
-    distance_to_membrane_threshold: float
-) -> List[float]:
+    distance_to_membrane_threshold: float,
+    angular_gap_threshold: float
+) -> Tuple[List[float], List[float], List[float]]:
     """Runs the maths for all the particles."""
     #maps the segmentation mask into a a highly optimised search index so it can find the nearest membrane a lot quicker.
     tree = cKDTree(membrane_coords)
@@ -137,6 +197,8 @@ def compute_all_tilts(
     patch_indices_list = tree.query_ball_point(closest_membrane_points, r=patch_radius)
 
     calculated_angles = []
+    calculated_curvatures = []
+    calculated_gaps = []
 
     #number every item in the patch indices list using enumerate
     #i catches the item number (starting from 0) and patch_indices catches the corresponding data (list of membrane voxels)
@@ -146,12 +208,16 @@ def compute_all_tilts(
         #protein - flag with NaN instead of computing a tilt for it
         if nearest_membrane_dist[i] > distance_to_membrane_threshold:
             calculated_angles.append(np.nan)
+            calculated_curvatures.append(np.nan)
+            calculated_gaps.append(np.nan)
             continue
 
         #here we might clean up some poor particle picks that don't have membrane within the assigned radius or ones which are near a non-segmented membrane (e.g. due to missing wedge etc).
         #instead of crashing we end up with a NaN for these, so they can be filtered out in the analysis.
         if len(patch_indices) < 3:
             calculated_angles.append(np.nan)
+            calculated_curvatures.append(np.nan)
+            calculated_gaps.append(np.nan)
             continue
 
         #put the xyz coordinates for this patch through our function to get the membrane normal
@@ -162,6 +228,16 @@ def compute_all_tilts(
         #its local patch - not its orientation, which is the thing we're about to measure against it
         membrane_normal = resolve_normal_sign(membrane_normal, patch_coords, particle_coords[i])
 
+        #plausibility check: a patch with no coverage on one side (fragment edge, missing-wedge dropout)
+        #can bias the fitted normal - record the gap either way, but only trust the tilt/curvature for
+        #this particle if the patch actually has reasonably complete coverage around it
+        angular_gap = calculate_angular_gap(patch_coords, closest_membrane_points[i], membrane_normal)
+        calculated_gaps.append(angular_gap)
+        if angular_gap > angular_gap_threshold:
+            calculated_angles.append(np.nan)
+            calculated_curvatures.append(np.nan)
+            continue
+
         #put the eulers from the star file through our function to get the particle vector)
         rot, tilt, psi = eulers[i]
         particle_vector = euler_to_z_vector(rot, tilt, psi)
@@ -170,7 +246,12 @@ def compute_all_tilts(
         angle_deg = calculate_tilt_angle(particle_vector, membrane_normal)
         calculated_angles.append(angle_deg)
 
-    return calculated_angles
+        #sign/size of the local curvature relative to the particle - negative (convex, particle
+        #outside) is expected; positive (concave, particle inside the membrane) is worth flagging
+        curvature = calculate_local_curvature(patch_coords, closest_membrane_points[i], membrane_normal)
+        calculated_curvatures.append(curvature)
+
+    return calculated_angles, calculated_curvatures, calculated_gaps
 
 
 @app.command()
@@ -188,6 +269,12 @@ def analyze_tilts(
                                   "segmented membrane point (roughly the glycoprotein's ectodomain height) - "
                                   "particles further than this are flagged as distance-based outliers. Tune "
                                   "this to your own structure/dataset")] = 85.0,
+    angular_gap_threshold: Annotated[
+        float, typer.Option("--angular-gap-threshold",
+                             help="Maximum plausible gap in degrees in the membrane coverage around a particle "
+                                  "(e.g. from a segmentation fragment edge or missing-wedge dropout) - particles "
+                                  "whose patch has a wider empty angular sector than this are flagged as "
+                                  "coverage-based outliers. Checked at whichever --patch_radius you run with")] = 40.0,
     output: Annotated[Path, typer.Option("--output", "-o", help="Output STAR file to save results")] = Path(
         "tilts_output.star")
 ):
@@ -221,6 +308,11 @@ def analyze_tilts(
                    f"got {distance_to_membrane_threshold}", err=True)
         raise typer.Exit(code=1)
 
+    if not 0 < angular_gap_threshold <= 360:
+        typer.echo(f"Input Error: --angular-gap-threshold must be a number between 0 and 360, "
+                   f"got {angular_gap_threshold}", err=True)
+        raise typer.Exit(code=1)
+
     #attempts to load the segmentation file and star and raises an error if it can't
     try:
         typer.echo(f"Loading segmentation from: {seg_file}")
@@ -249,19 +341,29 @@ def analyze_tilts(
     typer.echo(f"Local patch radius set to {patch_radius_vox:.2f} voxels ({patch_radius} A).")
     typer.echo(f"Distance-to-membrane plausibility threshold set to {distance_to_membrane_threshold_vox:.2f} "
                f"voxels ({distance_to_membrane_threshold} A).")
+    typer.echo(f"Angular coverage gap threshold set to {angular_gap_threshold} degrees.")
 
     typer.echo("Building KD-Tree, extracting patches, and calculating normals...")
-    calculated_angles = compute_all_tilts(
+    calculated_angles, calculated_curvatures, calculated_gaps = compute_all_tilts(
         particle_coords=particle_coords_vox,
         eulers=eulers,
         membrane_coords=membrane_coords_vox,
         patch_radius=patch_radius_vox,
-        distance_to_membrane_threshold=distance_to_membrane_threshold_vox
+        distance_to_membrane_threshold=distance_to_membrane_threshold_vox,
+        angular_gap_threshold=angular_gap_threshold
     )
 
     #df is the same object as the relevant entry in df_dict (or df_dict itself, if the STAR file
     #had no named blocks), so this mutation is already reflected in df_dict - nothing else to write back
     df['rlnMembraneTiltAngle'] = calculated_angles
+    #negative = convex, membrane bulges toward the particle (expected); positive = concave, membrane
+    #wraps around the particle (implausible pick) - exposed as its own column so it can be inspected
+    #or filtered on directly (e.g. in ArtiaX) rather than only trusting it from the CLI's own diagnostics
+    df['rlnMembraneCurvature'] = calculated_curvatures
+    #widest empty angular sector (degrees) around the particle's patch - recorded for every particle
+    #with a valid patch even if it exceeded --angular-gap-threshold and got excluded, so it's visible
+    #why a given particle's tilt/curvature came back NaN, not just that it did
+    df['rlnAngularCoverageGap'] = calculated_gaps
 
     starfile.write(df_dict, output, overwrite=True)
     typer.echo(f"Success! Analysis complete. Output saved to: {output}")
