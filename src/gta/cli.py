@@ -552,5 +552,9 @@ def analyze_tilts(
     starfile.write(accepted_data, accepted_output, overwrite=True)
     typer.echo(f"Accepted-only particles ({len(accepted_df)}/{len(df)}) saved to: {accepted_output}")
 
+#imported for its side effect of registering the `review` command on `app` above - placed here,
+#after `app` is fully defined, to avoid a circular import at module load time
+from gta import review  # noqa: E402,F401
+
 if __name__ == "__main__":
     app()
