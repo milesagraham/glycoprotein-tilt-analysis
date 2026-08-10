@@ -12,11 +12,17 @@ between that normal and the particle's own orientation.
 
 ## Installation
 
+Create a conda environment and `pip install` the package into it:
+
 ```bash
+conda create -n gta python=3.10
+conda activate gta
 pip install -e .
 ```
 
-This installs the `gta` command and its dependencies (`typer`, `mrcfile`, `starfile`, `numpy`, `scipy`, `pandas`).
+This installs the `gta` command and its dependencies (`typer`, `mrcfile`, `starfile`, `numpy`, `scipy`,
+`pandas`, `flask`, `matplotlib`). Python 3.8+ works; 3.10 is just a safe default. Re-run `pip install -e .`
+after pulling new changes, and `conda activate gta` again at the start of every new shell session.
 
 ## Usage
 
