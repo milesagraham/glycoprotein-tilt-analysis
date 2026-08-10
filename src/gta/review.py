@@ -37,7 +37,7 @@ from gta.cli import (
     PATCH_RADIUS_SEARCH_STEP_A,
 )
 
-#review image geometry - matches the normal-referenced "true angle" view from the report (Fig. 8)
+#review image geometry - matches the 3 orthogonal, normal-referenced views from the report (Fig. 8)
 BOX_A = 300.0
 BOX_PIXELS = 170
 ARROW_LEN_A = 70.0
@@ -78,25 +78,43 @@ def _extract_slice(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis
     return map_coordinates(tomo, coords, order=1, mode='nearest')
 
 
-def _save_review_panel(path: Path, img: np.ndarray, orientation_2d: np.ndarray) -> None:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, ax = plt.subplots(figsize=(5, 5))
+def _draw_panel(ax, img: np.ndarray, particle_2d: Optional[np.ndarray], normal_2d: Optional[np.ndarray],
+                 title: str) -> None:
     vmin, vmax = np.percentile(img, [1, 99])
     ax.imshow(img, origin='lower', cmap='gray', vmin=vmin, vmax=vmax,
               extent=[-BOX_A / 2, BOX_A / 2, -BOX_A / 2, BOX_A / 2])
     ax.scatter(0, 0, c='#f9a825', s=90, marker='+', linewidth=2.2, zorder=5)
-    ax.annotate('', xy=(0, ARROW_LEN_A), xytext=(0, 0),
-                arrowprops=dict(arrowstyle='-|>', color='#1f77b4', linewidth=2.6))
-    ax.annotate('', xy=tuple(orientation_2d * ARROW_LEN_A), xytext=(0, 0),
-                arrowprops=dict(arrowstyle='-|>', color='#d1495b', linewidth=2.6))
+    if normal_2d is not None:
+        ax.annotate('', xy=tuple(normal_2d * ARROW_LEN_A), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle='-|>', color='#1f77b4', linewidth=2.6))
+    if particle_2d is not None:
+        ax.annotate('', xy=tuple(particle_2d * ARROW_LEN_A), xytext=(0, 0),
+                    arrowprops=dict(arrowstyle='-|>', color='#d1495b', linewidth=2.6))
+    ax.set_title(title, fontsize=10, color='#c7d0d1')
     ax.set_xticks([]); ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_visible(False)
-    fig.tight_layout(pad=0)
-    fig.savefig(path, dpi=110, bbox_inches='tight', pad_inches=0.02)
+
+
+def _save_review_panel(
+    path: Path,
+    img_top: np.ndarray, img_true: np.ndarray, img_ortho: np.ndarray,
+    pv_top: np.ndarray, pv_true: np.ndarray, pv_ortho: np.ndarray,
+) -> None:
+    """Renders the same 3 orthogonal views used in the diagnostic report (Fig. 8): a top-down look
+    down the membrane normal, a side view aligned to the particle's own azimuth (shows the true,
+    undistorted 3D tilt angle), and the side view 90 degrees around the normal from that - together
+    giving full 3D context instead of one view that can make a plausible tilt look wrong."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4.2), facecolor='#14191a')
+    _draw_panel(axes[0], img_top, pv_top, None, "top-down (looking down normal)")
+    _draw_panel(axes[1], img_true, pv_true, np.array([0, 1]), "side - true angle")
+    _draw_panel(axes[2], img_ortho, pv_ortho, np.array([0, 1]), "side - orthogonal (90° around normal)")
+    fig.tight_layout(pad=0.6)
+    fig.savefig(path, dpi=105, facecolor=fig.get_facecolor(), bbox_inches='tight', pad_inches=0.08)
     plt.close(fig)
 
 
@@ -194,12 +212,18 @@ def analyze_tomogram_for_review(
         tangential = pv - (pv @ n_axis) * n_axis
         tnorm = np.linalg.norm(tangential)
         h_axis = tangential / tnorm if tnorm > 1e-6 else build_tangent_frame(n_axis)[0]
+        h_perp = np.cross(n_axis, h_axis)
 
-        img = _extract_slice(tomo, rec['pos'], h_axis, n_axis, grid_a, grid_b)
-        pv_2d = np.array([pv @ h_axis, pv @ n_axis])
+        img_top = _extract_slice(tomo, rec['pos'], h_axis, h_perp, grid_a, grid_b)
+        img_true = _extract_slice(tomo, rec['pos'], h_axis, n_axis, grid_a, grid_b)
+        img_ortho = _extract_slice(tomo, rec['pos'], h_perp, n_axis, grid_a, grid_b)
+
+        pv_top = np.array([pv @ h_axis, pv @ h_perp])
+        pv_true = np.array([pv @ h_axis, pv @ n_axis])
+        pv_ortho = np.array([pv @ h_perp, pv @ n_axis])
 
         filename = f"idx{rec['idx']}.png"
-        _save_review_panel(stem_cache_dir / filename, img, pv_2d)
+        _save_review_panel(stem_cache_dir / filename, img_top, img_true, img_ortho, pv_top, pv_true, pv_ortho)
 
         records.append(dict(
             key=f"{stem}:{rec['idx']}", stem=stem, idx=int(rec['idx']),
@@ -306,9 +330,9 @@ INDEX_HTML = r"""<!doctype html>
   #counts b.acc { color: var(--teal); } #counts b.rej { color: var(--crimson); }
   main { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 16px; gap: 28px; }
   #imgwrap { position: relative; border: 3px solid var(--line); border-radius: 10px; overflow: hidden;
-             transition: border-color 0.1s; line-height: 0; }
+             transition: border-color 0.1s; line-height: 0; background: #14191a; }
   #imgwrap.acc { border-color: var(--teal); } #imgwrap.rej { border-color: var(--crimson); }
-  #img { max-height: 72vh; max-width: 56vw; display: block; }
+  #img { max-height: 62vh; max-width: 80vw; display: block; }
   #badge { position: absolute; top: 10px; right: 10px; padding: 3px 10px; border-radius: 5px;
            font-size: 12px; font-weight: 600; letter-spacing: 0.03em; display: none; }
   #badge.acc { display: block; background: var(--teal); color: #06201d; }
