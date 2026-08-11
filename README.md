@@ -71,6 +71,13 @@ differently. Everything else has a sensible default.
 
 Run `gta analyze-tilts --help` for the full list.
 
+`--workers` parallelizes across tomograms using Python's `ProcessPoolExecutor`, which only spreads
+work across CPU cores on the single machine the command is running on - it cannot reach across
+nodes. On a cluster, submit `gta analyze-tilts` (with or without `--prepare-review`) as a
+**single-node** job, sized to that node's core count; requesting multiple SLURM nodes for one
+invocation will not speed it up, since every node but the one actually running the process sits
+idle.
+
 #### Output
 
 Two STAR files are written per tomogram to `data_dir/tilts_output/` (not into `starfiles/` itself,
