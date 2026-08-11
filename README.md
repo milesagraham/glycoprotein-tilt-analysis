@@ -81,7 +81,11 @@ review queue. All the same threshold options as `analyze-tilts` are available (r
 `gta review --help` for the full list).
 
 Everything expensive (the adaptive patch-radius search, tomogram slicing, image rendering) runs
-once up front, before the server starts, so the review itself has no lag. Once it's running:
+once up front, before the server starts, so the review itself has no lag. This precompute step is
+itself cached per tomogram in `data_dir/gta_review_cache/`, keyed on the input files' size/mtime
+and the threshold/radius options - closing the tool and restarting `gta review` later (e.g. to
+resume a manual triage session, or after a cluster job gets interrupted) reuses the cached images
+instead of recomputing them, as long as no input file or option changed. Once it's running:
 
 - Open the printed URL directly, or - if running on a remote cluster - tunnel it first:
   ```bash
@@ -90,7 +94,7 @@ once up front, before the server starts, so the review itself has no lag. Once i
   then open `http://localhost:5050` locally.
 - `space` accepts the current particle and advances; `Backspace`/`Delete` rejects it (junk) and
   advances; `←`/`→` navigate without deciding; `z` undoes the last decision.
-- Decisions are saved continuously to `data_dir/.gta_review_cache/decisions.json`, so a review
+- Decisions are saved continuously to `data_dir/gta_review_cache/decisions.json`, so a review
   session can be closed and resumed later without losing progress.
 - The "Export reviewed STAR files" button writes one `<stem>_reviewed.star` per tomogram
   (accepted particles only) next to that tomogram's input STAR file.

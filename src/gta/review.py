@@ -6,10 +6,15 @@ Design notes:
 - All the expensive work (adaptive patch-radius search, tomogram slicing, image rendering) runs
   once up front, before the server starts. The review UI itself only ever serves pre-rendered
   static images, so keying through hundreds of particles has no per-interaction lag.
+- That precompute is cached to disk per tomogram (fingerprinted on input file size/mtime and the
+  threshold/radius options), and decisions are saved continuously to decisions.json, so restarting
+  `gta review` on the same data_dir - to resume a review session later - is near-instant instead
+  of repeating the analysis from scratch.
 - Reuses the exact same geometry functions as `gta analyze-tilts` (imported from gta.cli), so a
   particle that would be accepted/rejected by the CLI is accepted/rejected here identically -
   review is a second, manual pass on top of the same automatic criteria, not a separate pipeline.
 """
+import hashlib
 import json
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -75,6 +80,24 @@ def discover_tomogram_sets(data_dir: Path) -> List[dict]:
 
     return [dict(stem=s, tomogram=tomo_files[s], segmentation=seg_files[s], starfile=star_files[s])
             for s in common_stems]
+
+
+def _file_fingerprint(path: Path) -> str:
+    st = path.stat()
+    return f"{st.st_size}:{st.st_mtime_ns}"
+
+
+def _tomogram_fingerprint(tomo_set: dict, params: dict) -> str:
+    """Identifies one tomogram's cached analysis - a fresh run only skips recomputation if none of
+    the three input files (by size/mtime) and none of the threshold/radius parameters have changed
+    since the cache was written, so a resumed review session is safe to trust blindly."""
+    parts = [
+        _file_fingerprint(tomo_set['tomogram']),
+        _file_fingerprint(tomo_set['segmentation']),
+        _file_fingerprint(tomo_set['starfile']),
+        json.dumps(params, sort_keys=True),
+    ]
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()
 
 
 def _extract_slice(tomo: np.ndarray, center: np.ndarray, axis1: np.ndarray, axis2: np.ndarray,
@@ -153,8 +176,37 @@ def analyze_tomogram_for_review(
     adaptive_patch_radius: bool, patch_radius: float, min_patch_radius: float, max_patch_radius: float,
 ) -> List[dict]:
     """Runs the same accept/reject pipeline as `gta analyze-tilts` for one tomogram, then renders
-    a review image for every particle that passes it. Returns one record dict per accepted particle."""
+    a review image for every particle that passes it. Returns one record dict per accepted particle.
+
+    Results are cached to disk (records.json + fingerprint.txt in the tomogram's cache subdir) so
+    that reopening `gta review` on the same data_dir - e.g. resuming a manual triage session later -
+    doesn't repeat the adaptive patch-radius search and image rendering unless an input file or
+    parameter actually changed."""
     stem = tomo_set['stem']
+    stem_cache_dir = cache_dir / stem
+    stem_cache_dir.mkdir(parents=True, exist_ok=True)
+    records_path = stem_cache_dir / "records.json"
+    fingerprint_path = stem_cache_dir / "fingerprint.txt"
+
+    params = dict(
+        seg_apx=seg_apx, particles_apx=particles_apx,
+        distance_to_membrane_threshold=distance_to_membrane_threshold,
+        angular_gap_threshold=angular_gap_threshold, max_tilt_angle=max_tilt_angle,
+        adaptive_patch_radius=adaptive_patch_radius, patch_radius=patch_radius,
+        min_patch_radius=min_patch_radius, max_patch_radius=max_patch_radius,
+    )
+    fingerprint = _tomogram_fingerprint(tomo_set, params)
+    if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
+        records = json.loads(records_path.read_text())
+        typer.echo(f"[{stem}] inputs and parameters unchanged since last run - reusing "
+                   f"{len(records)} cached review image(s), skipping recomputation.")
+        return records
+
+    def _finish(records: List[dict]) -> List[dict]:
+        records_path.write_text(json.dumps(records, indent=2))
+        fingerprint_path.write_text(fingerprint)
+        return records
+
     typer.echo(f"[{stem}] loading segmentation + star...")
     membrane_coords_vox = load_segmentation_coords(tomo_set['segmentation'])
     df, _, _ = load_star_data(tomo_set['starfile'])
@@ -221,7 +273,7 @@ def analyze_tomogram_for_review(
 
     typer.echo(f"[{stem}] {len(accepted)}/{len(df)} particles pass the automatic criteria.")
     if not accepted:
-        return []
+        return _finish([])
 
     typer.echo(f"[{stem}] loading tomogram density and rendering review images...")
     with mrcfile.open(tomo_set['tomogram'], permissive=True) as mrc:
@@ -234,9 +286,6 @@ def analyze_tomogram_for_review(
     context_half_width_vox = (CONTEXT_BOX_A / 2) / seg_apx
     context_grid_1d = np.linspace(-context_half_width_vox, context_half_width_vox, CONTEXT_BOX_PIXELS)
     context_grid_b, context_grid_a = np.meshgrid(context_grid_1d, context_grid_1d, indexing='ij')
-
-    stem_cache_dir = cache_dir / stem
-    stem_cache_dir.mkdir(parents=True, exist_ok=True)
 
     records = []
     for rec in accepted:
@@ -271,7 +320,7 @@ def analyze_tomogram_for_review(
         ))
 
     typer.echo(f"[{stem}] {len(records)} review images ready.")
-    return records
+    return _finish(records)
 
 
 def build_review_app(all_records: List[dict], cache_dir: Path, tomogram_starfiles: Dict[str, Path]):
@@ -586,7 +635,7 @@ def review(
 
     typer.echo(f"Found {len(tomo_sets)} tomogram(s) to review: {[s['stem'] for s in tomo_sets]}")
 
-    cache_dir = data_dir / ".gta_review_cache"
+    cache_dir = data_dir / "gta_review_cache"
     cache_dir.mkdir(exist_ok=True)
 
     all_records: List[dict] = []
