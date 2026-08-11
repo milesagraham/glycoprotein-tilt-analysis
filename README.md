@@ -85,7 +85,14 @@ once up front, before the server starts, so the review itself has no lag. This p
 itself cached per tomogram in `data_dir/gta_review_cache/`, keyed on the input files' size/mtime
 and the threshold/radius options - closing the tool and restarting `gta review` later (e.g. to
 resume a manual triage session, or after a cluster job gets interrupted) reuses the cached images
-instead of recomputing them, as long as no input file or option changed. Once it's running:
+instead of recomputing them, as long as no input file or option changed.
+
+Tomograms are independent, so this precompute is parallelized across them - `--workers` (default 4)
+sets how many run at once. Each worker holds one whole tomogram's density volume in memory, so on a
+large batch (e.g. hundreds of tomograms) raise `--workers` to match available cores, but watch RAM
+and scale it back if you hit memory pressure. `--workers 1` disables parallelism.
+
+Once it's running:
 
 - Open the printed URL directly, or - if running on a remote cluster - tunnel it first:
   ```bash

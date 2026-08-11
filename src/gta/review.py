@@ -10,12 +10,16 @@ Design notes:
   threshold/radius options), and decisions are saved continuously to decisions.json, so restarting
   `gta review` on the same data_dir - to resume a review session later - is near-instant instead
   of repeating the analysis from scratch.
+- Tomograms are independent of each other, so the precompute is parallelized across a process pool
+  (one tomogram per worker) rather than run one at a time - see --workers.
 - Reuses the exact same geometry functions as `gta analyze-tilts` (imported from gta.cli), so a
   particle that would be accepted/rejected by the CLI is accepted/rejected here identically -
   review is a second, manual pass on top of the same automatic criteria, not a separate pipeline.
 """
+import functools
 import hashlib
 import json
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -608,6 +612,12 @@ def review(
     max_tilt_angle: Annotated[
         float, typer.Option("--max-tilt-angle", help="See gta analyze-tilts --help")] = 80.0,
     port: Annotated[int, typer.Option("--port", help="Local port to serve the review UI on")] = 5050,
+    workers: Annotated[
+        int, typer.Option("--workers", "-j",
+                           help="Number of tomograms to analyze in parallel (they're fully independent "
+                                "of each other). Each worker holds one whole tomogram's density volume "
+                                "in memory at once, so raise this cautiously if RAM is limited. 1 "
+                                "disables parallelism and analyzes tomograms one at a time.")] = 4,
 ):
     """
     Launch a local web app to rapidly accept/reject particles by eye, using real tomogram density
@@ -627,6 +637,10 @@ def review(
         typer.echo("Input Error: --seg_apx and --particles_apx must be positive numbers", err=True)
         raise typer.Exit(code=1)
 
+    if workers < 1:
+        typer.echo("Input Error: --workers must be at least 1", err=True)
+        raise typer.Exit(code=1)
+
     try:
         tomo_sets = discover_tomogram_sets(data_dir)
     except (FileNotFoundError, ValueError) as e:
@@ -638,16 +652,23 @@ def review(
     cache_dir = data_dir / "gta_review_cache"
     cache_dir.mkdir(exist_ok=True)
 
-    all_records: List[dict] = []
-    tomogram_starfiles: Dict[str, Path] = {}
-    for tomo_set in tomo_sets:
-        records = analyze_tomogram_for_review(
-            tomo_set, cache_dir, seg_apx, particles_apx,
-            distance_to_membrane_threshold, angular_gap_threshold, max_tilt_angle,
-            adaptive_patch_radius, patch_radius, min_patch_radius, max_patch_radius,
-        )
-        all_records.extend(records)
-        tomogram_starfiles[tomo_set["stem"]] = tomo_set["starfile"]
+    tomogram_starfiles: Dict[str, Path] = {s["stem"]: s["starfile"] for s in tomo_sets}
+
+    analyze_one = functools.partial(
+        analyze_tomogram_for_review, cache_dir=cache_dir, seg_apx=seg_apx, particles_apx=particles_apx,
+        distance_to_membrane_threshold=distance_to_membrane_threshold,
+        angular_gap_threshold=angular_gap_threshold, max_tilt_angle=max_tilt_angle,
+        adaptive_patch_radius=adaptive_patch_radius, patch_radius=patch_radius,
+        min_patch_radius=min_patch_radius, max_patch_radius=max_patch_radius,
+    )
+    if workers == 1 or len(tomo_sets) == 1:
+        per_tomogram_records = [analyze_one(tomo_set) for tomo_set in tomo_sets]
+    else:
+        typer.echo(f"Analyzing up to {min(workers, len(tomo_sets))} tomogram(s) at a time...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            per_tomogram_records = list(executor.map(analyze_one, tomo_sets))
+
+    all_records: List[dict] = [r for records in per_tomogram_records for r in records]
 
     if not all_records:
         typer.echo("No particles passed the automatic criteria in any tomogram - nothing to review.", err=True)
