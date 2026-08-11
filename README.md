@@ -26,18 +26,37 @@ after pulling new changes, and `conda activate gta` again at the start of every 
 
 ## Usage
 
-`gta` has two subcommands: `analyze-tilts` (compute tilt angles) and `review` (interactively
-triage the results). Run `gta --help` to see both.
+`gta` is a two-step, batch-first tool: `analyze-tilts` always computes tilt angles for every
+tomogram found under a directory, and `review` is a strictly separate second step that only ever
+displays results `analyze-tilts` already computed - it never runs any analysis itself. Run
+`gta --help` to see both commands.
+
+### Directory layout
+
+Both commands take one `data_dir` argument, expected to contain these subdirectories, with
+matching files (same filename stem, e.g. `ts_028.mrc` / `ts_028.star`) across them treated as one
+tomogram:
+
+- `segmentations/` — one segmentation `.mrc` per tomogram. Always required.
+- `starfiles/` — one RELION-style particle `.star` file per tomogram. Always required.
+- `tomograms/` — one tomogram density `.mrc` per tomogram. Only required when using
+  `--prepare-review` (see below) - plain tilt-angle calculation never touches the density volume,
+  only the segmentation and particle coordinates.
+
+### Step 1: `gta analyze-tilts`
+
+For each particle, finds the nearest point on the segmented membrane, fits a local plane to
+estimate the membrane normal there, and measures the angle between that normal and the particle's
+own orientation. Runs across every matched tomogram under `data_dir`, in parallel:
 
 ```bash
-gta analyze-tilts segmentation.mrc particles.star -11-seg_apx 7.456 --particles_apx 3.728
+gta analyze-tilts /path/to/data_dir --seg_apx 7.456 --particles_apx 3.728
 ```
 
-`seg_file` and `star_file` are positional; pixel sizes are required since the
-segmentation and particle coordinates are often binned differently. Everything
-else has a sensible default.
+Pixel sizes are required since the segmentation and particle coordinates are often binned
+differently. Everything else has a sensible default.
 
-### Key options
+#### Key options
 
 | Option | Default | What it does |
 |---|---|---|
@@ -47,52 +66,68 @@ else has a sensible default.
 | `--distance-to-membrane-threshold` | 85 Å | Particles farther than this from any segmented membrane are flagged as implausible picks (roughly the expected ectodomain height). |
 | `--angular-gap-threshold` | 40° | Particles whose local patch has a wide empty angular sector (segmentation edge, missing-wedge dropout) are flagged as unreliable. |
 | `--max-tilt-angle` | 80° | Particles tilted more than this are flagged as implausible (a real membrane-anchored glycoprotein can't tilt close to 90° without its ectodomain clashing into the membrane - typically junk picks, e.g. on segmented ice contamination). |
-| `--output` / `-o` | `tilts_output.star` | Output path. |
+| `--workers` / `-j` | 4 | Number of tomograms analyzed in parallel - they're fully independent of each other. `--workers 1` disables parallelism. |
+| `--prepare-review` | off | Also render the tomogram density images `gta review` needs (see below). Requires `tomograms/`. |
 
 Run `gta analyze-tilts --help` for the full list.
 
-## Output
+#### Output
 
-Two STAR files are written:
+Two STAR files are written per tomogram to `data_dir/tilts_output/` (not into `starfiles/` itself,
+so re-running doesn't pick its own previous outputs back up as spurious input):
 
-- `<output>.star` — every input particle, with five new columns:
+- `<stem>_tilts_output.star` — every input particle, with five new columns:
   - `rlnOriginalIndex` — the particle's row position in the input STAR file, so a specific particle can be found again later (in this output, or in ArtiaX).
   - `rlnMembraneTiltAngle` — the result, in degrees. `NaN` for particles excluded by any of the checks below.
   - `rlnMembraneCurvature` — sign/size of the local membrane curvature relative to the particle (negative = convex/expected, positive = concave, i.e. the particle appears to sit inside the membrane rather than on it).
   - `rlnAngularCoverageGap` — widest empty angular sector (degrees) found around the particle's patch, recorded even for excluded particles so it's clear why.
   - `rlnPatchRadiusUsed` — the patch radius (Å) actually used for that particle.
-- `<output>_accepted_coordinates.star` — the same, with excluded (`NaN`) particles dropped, ready to load directly into tools like ArtiaX that can't filter on `NaN`.
+- `<stem>_tilts_output_accepted_coordinates.star` — the same, with excluded (`NaN`) particles dropped, ready to load directly into tools like ArtiaX that can't filter on `NaN`.
 
-## Reviewing results: `gta review`
+### Step 2: reviewing results with `gta review`
 
 The four automatic criteria above catch most problems, but not everything (e.g. a particle
-sitting on segmented ice contamination can still pass all four). `gta review` launches a local
-web app for fast, keyboard-driven manual triage on top of the automatically-accepted particles,
-showing a real tomogram slice through each pick oriented to its own fitted membrane normal.
+sitting on segmented ice contamination can still pass all four). Add `--prepare-review` to
+`analyze-tilts` to also render, for every automatically-accepted particle, a real tomogram slice
+oriented to its own fitted membrane normal:
 
 ```bash
-gta review /path/to/data_dir --seg_apx 7.456 --particles_apx 3.728
+gta analyze-tilts /path/to/data_dir --seg_apx 7.456 --particles_apx 3.728 --prepare-review
 ```
 
-`data_dir` must contain three subdirectories - `tomograms/`, `segmentations/`, and `starfiles/` -
-and files that share the same stem (filename without extension) across all three are treated as
-one tomogram to review. Every particle from every matched tomogram is combined into a single
-review queue. All the same threshold options as `analyze-tilts` are available (run
-`gta review --help` for the full list).
+This needs a `tomograms/` subdirectory (unlike plain `analyze-tilts`) and writes its renders to
+`data_dir/gta_review_inputs/`. It's the expensive part of the whole tool (tomogram slicing, image
+rendering), so it's parallelized the same way across `--workers`, and results are cached per
+tomogram, fingerprinted on the input files and the options used - re-running only redoes tomograms
+whose inputs or parameters actually changed, so an interrupted batch job can safely be resubmitted.
 
-Everything expensive (the adaptive patch-radius search, tomogram slicing, image rendering) runs
-once up front, before the server starts, so the review itself has no lag. This precompute step is
-itself cached per tomogram in `data_dir/gta_review_cache/`, keyed on the input files' size/mtime
-and the threshold/radius options - closing the tool and restarting `gta review` later (e.g. to
-resume a manual triage session, or after a cluster job gets interrupted) reuses the cached images
-instead of recomputing them, as long as no input file or option changed.
+Once that's done, `gta review` launches a local web app for fast, keyboard-driven manual triage.
+It only ever reads `data_dir/gta_review_inputs/` and serves it - it never computes anything itself,
+and refuses to start if `--prepare-review` hasn't been run yet:
 
-Tomograms are independent, so this precompute is parallelized across them - `--workers` (default 4)
-sets how many run at once. Each worker holds one whole tomogram's density volume in memory, so on a
-large batch (e.g. hundreds of tomograms) raise `--workers` to match available cores, but watch RAM
-and scale it back if you hit memory pressure. `--workers 1` disables parallelism.
+```bash
+gta review /path/to/data_dir
+```
 
-Once it's running:
+Every particle from every prepared tomogram is combined into a single review queue.
+
+#### Splitting compute from review on a cluster
+
+Because `analyze-tilts --prepare-review` never starts a network server, and `gta review` never
+computes anything, they're a natural fit for opposite ends of a cluster: run the parallel analysis
+as a batch job on a compute node with a high `--workers`, then review on the login node:
+
+```bash
+# on a compute node, e.g. inside a Slurm job:
+gta analyze-tilts /path/to/data_dir --seg_apx 7.456 --particles_apx 3.728 --workers 32 --prepare-review
+```
+
+```bash
+# on the login node, once the batch job has finished:
+gta review /path/to/data_dir
+```
+
+Once `gta review` is running:
 
 - Open the printed URL directly, or - if running on a remote cluster - tunnel it first:
   ```bash
@@ -101,7 +136,7 @@ Once it's running:
   then open `http://localhost:5050` locally.
 - `space` accepts the current particle and advances; `Backspace`/`Delete` rejects it (junk) and
   advances; `←`/`→` navigate without deciding; `z` undoes the last decision.
-- Decisions are saved continuously to `data_dir/gta_review_cache/decisions.json`, so a review
+- Decisions are saved continuously to `data_dir/gta_review_inputs/decisions.json`, so a review
   session can be closed and resumed later without losing progress.
 - The "Export reviewed STAR files" button writes one `<stem>_reviewed.star` per tomogram
   (accepted particles only) next to that tomogram's input STAR file.

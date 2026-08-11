@@ -1,25 +1,27 @@
 """
-gta review: a local web app for rapidly accepting/rejecting particles by eye, using real
+gta review: the second-step web app for rapidly accepting/rejecting particles by eye, using real
 tomogram density slices oriented to each particle's fitted membrane normal.
 
 Design notes:
-- All the expensive work (adaptive patch-radius search, tomogram slicing, image rendering) runs
-  once up front, before the server starts. The review UI itself only ever serves pre-rendered
-  static images, so keying through hundreds of particles has no per-interaction lag.
-- That precompute is cached to disk per tomogram (fingerprinted on input file size/mtime and the
-  threshold/radius options), and decisions are saved continuously to decisions.json, so restarting
-  `gta review` on the same data_dir - to resume a review session later - is near-instant instead
-  of repeating the analysis from scratch.
-- Tomograms are independent of each other, so the precompute is parallelized across a process pool
-  (one tomogram per worker) rather than run one at a time - see --workers.
+- All the expensive work (adaptive patch-radius search, tomogram slicing, image rendering) happens
+  in `gta analyze-tilts --prepare-review` (in gta.cli), not here - this module only ever reads
+  data_dir/gta_review_inputs/ (written by that command) and serves it. It never computes anything
+  itself; if gta_review_inputs/ isn't there yet, `gta review` refuses to start rather than silently
+  computing it. render_review_data_for_tomogram() below is the one exception - it's the actual
+  image-rendering function, but it's only ever called from `gta analyze-tilts --prepare-review`,
+  never from the review command in this module.
+- Re-running `gta analyze-tilts --prepare-review` skips any tomogram whose input files and
+  parameters are unchanged since the last run (fingerprinted in
+  gta_review_inputs/<stem>/fingerprint.txt), so an interrupted batch job can be resubmitted
+  without repeating already-finished tomograms.
+- Decisions are saved continuously to gta_review_inputs/decisions.json, so a review session can be
+  closed and resumed later without losing progress.
 - Reuses the exact same geometry functions as `gta analyze-tilts` (imported from gta.cli), so a
   particle that would be accepted/rejected by the CLI is accepted/rejected here identically -
   review is a second, manual pass on top of the same automatic criteria, not a separate pipeline.
 """
-import functools
 import hashlib
 import json
-from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -57,33 +59,6 @@ ARROW_LEN_A = 70.0
 CONTEXT_BOX_A = 2000.0
 CONTEXT_BOX_PIXELS = 220
 CONTEXT_ARROW_LEN_A = 300.0
-
-
-def discover_tomogram_sets(data_dir: Path) -> List[dict]:
-    """Finds tomogram/segmentation/starfile triples that share an exact filename stem across the
-    tomograms/, segmentations/, and starfiles/ subdirectories - each is one tomogram to review."""
-    tomo_dir = data_dir / "tomograms"
-    seg_dir = data_dir / "segmentations"
-    star_dir = data_dir / "starfiles"
-    for d in (tomo_dir, seg_dir, star_dir):
-        if not d.is_dir():
-            raise FileNotFoundError(f"Expected subdirectory not found: {d}")
-
-    tomo_files = {p.stem: p for p in tomo_dir.glob("*.mrc")}
-    seg_files = {p.stem: p for p in seg_dir.glob("*.mrc")}
-    star_files = {p.stem: p for p in star_dir.glob("*.star")}
-
-    common_stems = sorted(set(tomo_files) & set(seg_files) & set(star_files))
-    all_stems = set(tomo_files) | set(seg_files) | set(star_files)
-    skipped = sorted(all_stems - set(common_stems))
-    if skipped:
-        typer.echo(f"Note: skipping {len(skipped)} file(s) without a matching stem in all three "
-                   f"subdirectories: {skipped}")
-    if not common_stems:
-        raise ValueError(f"No matching tomogram/segmentation/starfile triples found under {data_dir}")
-
-    return [dict(stem=s, tomogram=tomo_files[s], segmentation=seg_files[s], starfile=star_files[s])
-            for s in common_stems]
 
 
 def _file_fingerprint(path: Path) -> str:
@@ -174,23 +149,27 @@ def _save_context_panel(path: Path, img: np.ndarray, particle_2d: np.ndarray) ->
     plt.close(fig)
 
 
-def analyze_tomogram_for_review(
-    tomo_set: dict, cache_dir: Path, seg_apx: float, particles_apx: float,
+def render_review_data_for_tomogram(
+    tomo_set: dict, inputs_dir: Path, seg_apx: float, particles_apx: float,
     distance_to_membrane_threshold: float, angular_gap_threshold: float, max_tilt_angle: float,
     adaptive_patch_radius: bool, patch_radius: float, min_patch_radius: float, max_patch_radius: float,
 ) -> List[dict]:
-    """Runs the same accept/reject pipeline as `gta analyze-tilts` for one tomogram, then renders
-    a review image for every particle that passes it. Returns one record dict per accepted particle.
+    """Called from `gta analyze-tilts --prepare-review` (in gta.cli), never directly by this
+    module's own CLI command. Runs the same accept/reject pipeline as `gta analyze-tilts` for one
+    tomogram, then renders a review image for every particle that passes it. Writes one
+    self-contained records.json to inputs_dir/<stem>/ - the starfile path plus one record (metrics
+    + image paths) per accepted particle - which is all `gta review` needs later to serve that
+    tomogram; it never touches the tomogram or segmentation volume again. Returns the same records
+    as a plain list, for `gta analyze-tilts`'s own progress reporting.
 
-    Results are cached to disk (records.json + fingerprint.txt in the tomogram's cache subdir) so
-    that reopening `gta review` on the same data_dir - e.g. resuming a manual triage session later -
-    doesn't repeat the adaptive patch-radius search and image rendering unless an input file or
-    parameter actually changed."""
+    Re-running with the same input files and parameters is skipped (fingerprint match), so a
+    `gta analyze-tilts --prepare-review` batch job interrupted partway through a large tomogram set
+    can be resubmitted without repeating already-finished tomograms."""
     stem = tomo_set['stem']
-    stem_cache_dir = cache_dir / stem
-    stem_cache_dir.mkdir(parents=True, exist_ok=True)
-    records_path = stem_cache_dir / "records.json"
-    fingerprint_path = stem_cache_dir / "fingerprint.txt"
+    stem_dir = inputs_dir / stem
+    stem_dir.mkdir(parents=True, exist_ok=True)
+    records_path = stem_dir / "records.json"
+    fingerprint_path = stem_dir / "fingerprint.txt"
 
     params = dict(
         seg_apx=seg_apx, particles_apx=particles_apx,
@@ -201,13 +180,14 @@ def analyze_tomogram_for_review(
     )
     fingerprint = _tomogram_fingerprint(tomo_set, params)
     if records_path.exists() and fingerprint_path.exists() and fingerprint_path.read_text().strip() == fingerprint:
-        records = json.loads(records_path.read_text())
+        records = json.loads(records_path.read_text())["records"]
         typer.echo(f"[{stem}] inputs and parameters unchanged since last run - reusing "
-                   f"{len(records)} cached review image(s), skipping recomputation.")
+                   f"{len(records)} already-prepared review image(s), skipping recomputation.")
         return records
 
     def _finish(records: List[dict]) -> List[dict]:
-        records_path.write_text(json.dumps(records, indent=2))
+        records_path.write_text(json.dumps(
+            dict(stem=stem, starfile=str(tomo_set['starfile']), records=records), indent=2))
         fingerprint_path.write_text(fingerprint)
         return records
 
@@ -309,11 +289,11 @@ def analyze_tomogram_for_review(
         pv_ortho = np.array([pv @ h_perp, pv @ n_axis])
 
         filename = f"idx{rec['idx']}.png"
-        _save_review_panel(stem_cache_dir / filename, img_top, img_true, img_ortho, pv_top, pv_true, pv_ortho)
+        _save_review_panel(stem_dir / filename, img_top, img_true, img_ortho, pv_top, pv_true, pv_ortho)
 
         context_img = _extract_slice(tomo, rec['pos'], h_axis, n_axis, context_grid_a, context_grid_b)
         context_filename = f"idx{rec['idx']}_context.png"
-        _save_context_panel(stem_cache_dir / context_filename, context_img, pv_true)
+        _save_context_panel(stem_dir / context_filename, context_img, pv_true)
 
         records.append(dict(
             key=f"{stem}:{rec['idx']}", stem=stem, idx=int(rec['idx']),
@@ -327,11 +307,11 @@ def analyze_tomogram_for_review(
     return _finish(records)
 
 
-def build_review_app(all_records: List[dict], cache_dir: Path, tomogram_starfiles: Dict[str, Path]):
+def build_review_app(all_records: List[dict], inputs_dir: Path, tomogram_starfiles: Dict[str, Path]):
     from flask import Flask, jsonify, request, send_from_directory, Response
 
     flask_app = Flask(__name__)
-    decisions_path = cache_dir / "decisions.json"
+    decisions_path = inputs_dir / "decisions.json"
     decisions: Dict[str, str] = json.loads(decisions_path.read_text()) if decisions_path.exists() else {}
     history: List[str] = []
 
@@ -355,7 +335,7 @@ def build_review_app(all_records: List[dict], cache_dir: Path, tomogram_starfile
 
     @flask_app.route("/api/image/<stem>/<filename>")
     def image(stem, filename):
-        return send_from_directory(cache_dir / stem, filename)
+        return send_from_directory(inputs_dir / stem, filename)
 
     @flask_app.route("/api/decision", methods=["POST"])
     def decision():
@@ -589,41 +569,15 @@ init();
 @app.command()
 def review(
     data_dir: Annotated[Path, typer.Argument(
-        help="Directory containing tomograms/, segmentations/, and starfiles/ subdirectories - "
-             "matching files (same stem) across all three are treated as one tomogram to review")],
-    seg_apx: Annotated[float, typer.Option("--seg_apx", help="Segmentation/tomogram pixel size in Angstroms/pixel")],
-    particles_apx: Annotated[
-        float, typer.Option("--particles_apx", help="Particle coordinate pixel size in Angstroms/pixel")],
-    patch_radius: Annotated[
-        float, typer.Option("--patch_radius",
-                             help="Fixed patch radius in Angstroms - only used with "
-                                  "--no-adaptive-patch-radius")] = 150.0,
-    min_patch_radius: Annotated[
-        float, typer.Option("--min-patch-radius", help="Adaptive search minimum, in Angstroms")] = 40.0,
-    max_patch_radius: Annotated[
-        float, typer.Option("--max-patch-radius", help="Adaptive search maximum, in Angstroms")] = 150.0,
-    adaptive_patch_radius: Annotated[
-        bool, typer.Option("--adaptive-patch-radius/--no-adaptive-patch-radius",
-                            help="Same adaptive patch radius selection as gta analyze-tilts")] = True,
-    distance_to_membrane_threshold: Annotated[
-        float, typer.Option("--distance-to-membrane-threshold", help="See gta analyze-tilts --help")] = 85.0,
-    angular_gap_threshold: Annotated[
-        float, typer.Option("--angular-gap-threshold", help="See gta analyze-tilts --help")] = 40.0,
-    max_tilt_angle: Annotated[
-        float, typer.Option("--max-tilt-angle", help="See gta analyze-tilts --help")] = 80.0,
+        help="Directory previously prepared with `gta analyze-tilts --prepare-review` - i.e. "
+             "containing a gta_review_inputs/ subdirectory")],
     port: Annotated[int, typer.Option("--port", help="Local port to serve the review UI on")] = 5050,
-    workers: Annotated[
-        int, typer.Option("--workers", "-j",
-                           help="Number of tomograms to analyze in parallel (they're fully independent "
-                                "of each other). Each worker holds one whole tomogram's density volume "
-                                "in memory at once, so raise this cautiously if RAM is limited. 1 "
-                                "disables parallelism and analyzes tomograms one at a time.")] = 4,
 ):
     """
-    Launch a local web app to rapidly accept/reject particles by eye, using real tomogram density
-    slices oriented to each particle's own fitted membrane normal. Precomputes everything up
-    front so the review itself has no lag - point a browser at it (directly, or via an SSH tunnel
-    if running on a remote cluster) and use space/backspace to triage.
+    Launch a local web app to rapidly accept/reject particles by eye, using the tomogram density
+    images `gta analyze-tilts --prepare-review` already rendered. Only ever reads
+    data_dir/gta_review_inputs/ and serves it - never computes anything itself, so run
+    `gta analyze-tilts --prepare-review` first if you haven't (see `gta analyze-tilts --help`).
     """
     if not data_dir.is_dir():
         typer.echo(f"Input Error: {data_dir} is not a directory", err=True)
@@ -633,50 +587,30 @@ def review(
     #app's root_path (the installed gta package location), not the process cwd
     data_dir = data_dir.resolve()
 
-    if seg_apx <= 0 or particles_apx <= 0:
-        typer.echo("Input Error: --seg_apx and --particles_apx must be positive numbers", err=True)
+    inputs_dir = data_dir / "gta_review_inputs"
+    stem_dirs = (sorted(p for p in inputs_dir.iterdir() if (p / "records.json").exists())
+                 if inputs_dir.is_dir() else [])
+    if not stem_dirs:
+        typer.echo(f"Input Error: no prepared review data found under {inputs_dir}. Run "
+                   f"`gta analyze-tilts {data_dir} --seg_apx ... --particles_apx ... "
+                   f"--prepare-review` first (see `gta analyze-tilts --help`).", err=True)
         raise typer.Exit(code=1)
 
-    if workers < 1:
-        typer.echo("Input Error: --workers must be at least 1", err=True)
-        raise typer.Exit(code=1)
-
-    try:
-        tomo_sets = discover_tomogram_sets(data_dir)
-    except (FileNotFoundError, ValueError) as e:
-        typer.echo(f"Input Error: {e}", err=True)
-        raise typer.Exit(code=1)
-
-    typer.echo(f"Found {len(tomo_sets)} tomogram(s) to review: {[s['stem'] for s in tomo_sets]}")
-
-    cache_dir = data_dir / "gta_review_cache"
-    cache_dir.mkdir(exist_ok=True)
-
-    tomogram_starfiles: Dict[str, Path] = {s["stem"]: s["starfile"] for s in tomo_sets}
-
-    analyze_one = functools.partial(
-        analyze_tomogram_for_review, cache_dir=cache_dir, seg_apx=seg_apx, particles_apx=particles_apx,
-        distance_to_membrane_threshold=distance_to_membrane_threshold,
-        angular_gap_threshold=angular_gap_threshold, max_tilt_angle=max_tilt_angle,
-        adaptive_patch_radius=adaptive_patch_radius, patch_radius=patch_radius,
-        min_patch_radius=min_patch_radius, max_patch_radius=max_patch_radius,
-    )
-    if workers == 1 or len(tomo_sets) == 1:
-        per_tomogram_records = [analyze_one(tomo_set) for tomo_set in tomo_sets]
-    else:
-        typer.echo(f"Analyzing up to {min(workers, len(tomo_sets))} tomogram(s) at a time...")
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            per_tomogram_records = list(executor.map(analyze_one, tomo_sets))
-
-    all_records: List[dict] = [r for records in per_tomogram_records for r in records]
+    all_records: List[dict] = []
+    tomogram_starfiles: Dict[str, Path] = {}
+    for stem_dir in stem_dirs:
+        data = json.loads((stem_dir / "records.json").read_text())
+        all_records.extend(data["records"])
+        tomogram_starfiles[data["stem"]] = Path(data["starfile"])
 
     if not all_records:
-        typer.echo("No particles passed the automatic criteria in any tomogram - nothing to review.", err=True)
+        typer.echo("No particles passed the automatic criteria in any prepared tomogram - "
+                   "nothing to review.", err=True)
         raise typer.Exit(code=1)
 
-    typer.echo(f"\n{len(all_records)} particles ready for review across {len(tomo_sets)} tomogram(s).")
+    typer.echo(f"{len(all_records)} particles ready for review across {len(stem_dirs)} tomogram(s).")
 
-    flask_app = build_review_app(all_records, cache_dir, tomogram_starfiles)
+    flask_app = build_review_app(all_records, inputs_dir, tomogram_starfiles)
 
     typer.echo(f"\nStarting review server on port {port}.")
     typer.echo("If this is running on a remote cluster, from your local machine run:")

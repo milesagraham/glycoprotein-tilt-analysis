@@ -1,12 +1,14 @@
+import functools
 import typer
 import mrcfile
 import starfile
 import numpy as np
 import pandas as pd
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from scipy.spatial import cKDTree
 from typing_extensions import Annotated
-from typing import Tuple, List, Any, Optional
+from typing import Dict, Tuple, List, Any, Optional
 
 app = typer.Typer(help="GTA: Calculate tilt angles of glycoproteins relative to an irregular membrane.")
 
@@ -372,10 +374,130 @@ def compute_all_tilts(
     return calculated_angles, calculated_curvatures, calculated_gaps, calculated_radii
 
 
+def discover_tomogram_sets(data_dir: Path, require_tomograms: bool) -> List[dict]:
+    """Finds segmentation/starfile pairs (or, if require_tomograms, tomogram/segmentation/starfile
+    triples) that share an exact filename stem, across the segmentations/, starfiles/, and (if
+    required) tomograms/ subdirectories of data_dir - each is one tomogram to analyze. Tomograms
+    are only needed for --prepare-review's image rendering; plain tilt-angle analysis only needs
+    the segmentation and particle coordinates."""
+    seg_dir = data_dir / "segmentations"
+    star_dir = data_dir / "starfiles"
+    for d in (seg_dir, star_dir):
+        if not d.is_dir():
+            raise FileNotFoundError(f"Expected subdirectory not found: {d}")
+
+    seg_files = {p.stem: p for p in seg_dir.glob("*.mrc")}
+    star_files = {p.stem: p for p in star_dir.glob("*.star")}
+
+    if require_tomograms:
+        tomo_dir = data_dir / "tomograms"
+        if not tomo_dir.is_dir():
+            raise FileNotFoundError(f"Expected subdirectory not found: {tomo_dir} (required for --prepare-review)")
+        tomo_files = {p.stem: p for p in tomo_dir.glob("*.mrc")}
+        common_stems = sorted(set(tomo_files) & set(seg_files) & set(star_files))
+        all_stems = set(tomo_files) | set(seg_files) | set(star_files)
+    else:
+        tomo_files = {}
+        common_stems = sorted(set(seg_files) & set(star_files))
+        all_stems = set(seg_files) | set(star_files)
+
+    skipped = sorted(all_stems - set(common_stems))
+    if skipped:
+        typer.echo(f"Note: skipping {len(skipped)} file(s) without a matching stem in all required "
+                   f"subdirectories: {skipped}")
+    if not common_stems:
+        kind = "tomogram/segmentation/starfile triples" if require_tomograms else "segmentation/starfile pairs"
+        raise ValueError(f"No matching {kind} found under {data_dir}")
+
+    result = []
+    for s in common_stems:
+        entry = dict(stem=s, segmentation=seg_files[s], starfile=star_files[s])
+        if require_tomograms:
+            entry['tomogram'] = tomo_files[s]
+        result.append(entry)
+    return result
+
+
+def _process_tomogram_for_analysis(
+    tomo_set: dict, output_dir: Path, seg_apx: float, particles_apx: float,
+    distance_to_membrane_threshold: float, angular_gap_threshold: float, max_tilt_angle: float,
+    adaptive_patch_radius: bool, patch_radius: float, min_patch_radius: float, max_patch_radius: float,
+    prepare_review: bool, inputs_dir: Optional[Path],
+) -> dict:
+    """Runs the accept/reject tilt analysis for one tomogram and writes its two output STAR files
+    to output_dir - deliberately not into the starfiles/ input directory itself, since that would
+    get re-scanned as spurious input on the next run. If prepare_review is set, also renders the
+    tomogram density images `gta review` needs and writes them to inputs_dir/<stem>/. Returns a
+    small summary dict for the CLI's own progress reporting."""
+    stem = tomo_set['stem']
+    typer.echo(f"[{stem}] loading segmentation + star...")
+    membrane_coords_vox = load_segmentation_coords(tomo_set['segmentation'])
+    df, df_dict, block_name = load_star_data(tomo_set['starfile'])
+
+    scaling_factor = particles_apx / seg_apx
+    particle_coords_vox = df[['rlnCoordinateX', 'rlnCoordinateY', 'rlnCoordinateZ']].to_numpy() * scaling_factor
+    eulers = df[['rlnAngleRot', 'rlnAngleTilt', 'rlnAnglePsi']].to_numpy()
+
+    patch_radius_vox = patch_radius / seg_apx
+    min_patch_radius_vox = min_patch_radius / seg_apx
+    max_patch_radius_vox = max_patch_radius / seg_apx
+    patch_radius_step_vox = PATCH_RADIUS_SEARCH_STEP_A / seg_apx
+    distance_to_membrane_threshold_vox = distance_to_membrane_threshold / seg_apx
+
+    typer.echo(f"[{stem}] calculating tilt angles for {len(df)} particles...")
+    calculated_angles, calculated_curvatures, calculated_gaps, calculated_radii = compute_all_tilts(
+        particle_coords=particle_coords_vox,
+        eulers=eulers,
+        membrane_coords=membrane_coords_vox,
+        distance_to_membrane_threshold=distance_to_membrane_threshold_vox,
+        angular_gap_threshold=angular_gap_threshold,
+        max_tilt_angle=max_tilt_angle,
+        adaptive_patch_radius=adaptive_patch_radius,
+        patch_radius=patch_radius_vox,
+        min_patch_radius=min_patch_radius_vox,
+        max_patch_radius=max_patch_radius_vox,
+        patch_radius_step=patch_radius_step_vox,
+    )
+
+    df['rlnOriginalIndex'] = np.arange(len(df))
+    df['rlnMembraneTiltAngle'] = calculated_angles
+    df['rlnMembraneCurvature'] = calculated_curvatures
+    df['rlnAngularCoverageGap'] = calculated_gaps
+    df['rlnPatchRadiusUsed'] = np.array(calculated_radii) * seg_apx
+
+    output = output_dir / f"{stem}_tilts_output.star"
+    starfile.write(df_dict, output, overwrite=True)
+
+    accepted_df = df[df['rlnMembraneTiltAngle'].notna()].copy()
+    accepted_data = {**df_dict, block_name: accepted_df} if block_name is not None else accepted_df
+    accepted_output = output.with_name(f"{output.stem}_accepted_coordinates{output.suffix}")
+    starfile.write(accepted_data, accepted_output, overwrite=True)
+
+    typer.echo(f"[{stem}] {len(accepted_df)}/{len(df)} particles accepted. Saved {output.name} and "
+               f"{accepted_output.name}.")
+
+    n_review_images = None
+    if prepare_review:
+        #lazy import: gta.review imports back from this module at load time (for `app` and the
+        #geometry functions), so importing it here rather than at module level avoids relying on
+        #import order between the two circularly-dependent modules
+        from gta.review import render_review_data_for_tomogram
+        review_records = render_review_data_for_tomogram(
+            tomo_set, inputs_dir, seg_apx, particles_apx,
+            distance_to_membrane_threshold, angular_gap_threshold, max_tilt_angle,
+            adaptive_patch_radius, patch_radius, min_patch_radius, max_patch_radius,
+        )
+        n_review_images = len(review_records)
+
+    return dict(stem=stem, n_particles=len(df), n_accepted=len(accepted_df), n_review_images=n_review_images)
+
+
 @app.command()
 def analyze_tilts(
-    seg_file: Annotated[Path, typer.Argument(help="Path to the segmentation .mrc file")],
-    star_file: Annotated[Path, typer.Argument(help="Path to the RELION .star file")],
+    data_dir: Annotated[Path, typer.Argument(
+        help="Directory containing segmentations/ and starfiles/ subdirectories (and tomograms/ too, "
+             "if --prepare-review is set) - matching files (same stem) across them are treated as one "
+             "tomogram to analyze")],
     seg_apx: Annotated[float, typer.Option("--seg_apx", help="Segmentation pixel size in Angstroms/pixel")],
     particles_apx: Annotated[
         float, typer.Option("--particles_apx", help="Particle coordinate pixel size in Angstroms/pixel")],
@@ -416,21 +538,36 @@ def analyze_tilts(
                                   "into the membrane, so particles tilted more than this are flagged as implausible "
                                   "(typically junk picks, e.g. on segmented ice contamination). Tune this to your "
                                   "own structure/dataset")] = 80.0,
-    output: Annotated[Path, typer.Option("--output", "-o", help="Output STAR file to save results")] = Path(
-        "tilts_output.star")
+    prepare_review: Annotated[
+        bool, typer.Option("--prepare-review",
+                            help="Also render the tomogram density images `gta review` needs, writing "
+                                 "them to data_dir/gta_review_inputs/. Requires a tomograms/ "
+                                 "subdirectory under data_dir (not needed otherwise, since plain "
+                                 "tilt-angle calculation only needs the segmentation and particle "
+                                 "coordinates). Run `gta review data_dir` afterwards to triage the "
+                                 "results by eye - it never computes anything itself.")] = False,
+    workers: Annotated[
+        int, typer.Option("--workers", "-j",
+                           help="Number of tomograms to analyze in parallel (they're fully independent "
+                                "of each other). With --prepare-review, each worker also holds one "
+                                "whole tomogram's density volume in memory at once, so raise this "
+                                "cautiously if RAM is limited. 1 disables parallelism and analyzes "
+                                "tomograms one at a time.")] = 4,
 ):
     """
-    Load data, map spaces, run PCA on local membrane patches, and calculate particle tilt angles.
+    Computes tilt angles for every tomogram found under data_dir - PCA on local membrane patches vs.
+    each particle's own orientation - and writes two output STAR files per tomogram to
+    data_dir/tilts_output/. Batches over every matched segmentation/starfile pair found under
+    data_dir, in parallel (see --workers).
+
+    Pass --prepare-review to also render the tomogram density images `gta review` needs (this
+    additionally requires a tomograms/ subdirectory under data_dir) - then run `gta review data_dir`
+    afterwards to triage the results by eye; it never computes anything itself.
     """
-
-    #check inputs exist and are sane before attempting to load/process anything
-    if not seg_file.exists():
-        typer.echo(f"Input Error: Segmentation file not found: {seg_file}", err=True)
+    if not data_dir.is_dir():
+        typer.echo(f"Input Error: {data_dir} is not a directory", err=True)
         raise typer.Exit(code=1)
-
-    if not star_file.exists():
-        typer.echo(f"Input Error: STAR file not found: {star_file}", err=True)
-        raise typer.Exit(code=1)
+    data_dir = data_dir.resolve()
 
     if seg_apx <= 0:
         typer.echo(f"Input Error: --seg_apx must be a positive number, got {seg_apx}", err=True)
@@ -468,89 +605,53 @@ def analyze_tilts(
                    f"got {max_tilt_angle}", err=True)
         raise typer.Exit(code=1)
 
-    #attempts to load the segmentation file and star and raises an error if it can't
-    try:
-        typer.echo(f"Loading segmentation from: {seg_file}")
-        membrane_coords_vox = load_segmentation_coords(seg_file)
-        typer.echo(f"Found {len(membrane_coords_vox)} membrane voxels.")
-
-        typer.echo(f"Loading coordinates from: {star_file}")
-        df, df_dict, block_name = load_star_data(star_file)
-        typer.echo(f"Loaded {len(df)} particles.")
-
-    except (ValueError, KeyError) as e:
-        typer.echo(f"Data Error: {e}", err=True)
+    if workers < 1:
+        typer.echo("Input Error: --workers must be at least 1", err=True)
         raise typer.Exit(code=1)
 
-    #calculate scale factor to relate particles to the segmentation
-    scaling_factor = particles_apx / seg_apx
-    #convert the star coordinates accordingly
-    particle_coords_vox = df[['rlnCoordinateX', 'rlnCoordinateY', 'rlnCoordinateZ']].to_numpy() * scaling_factor
-    eulers = df[['rlnAngleRot', 'rlnAngleTilt', 'rlnAnglePsi']].to_numpy()
-    #figure out how many voxels the membrane extraction from our seg volume needs to be
-    patch_radius_vox = patch_radius / seg_apx
-    min_patch_radius_vox = min_patch_radius / seg_apx
-    max_patch_radius_vox = max_patch_radius / seg_apx
-    patch_radius_step_vox = PATCH_RADIUS_SEARCH_STEP_A / seg_apx
-    #same conversion for the plausibility distance threshold
-    distance_to_membrane_threshold_vox = distance_to_membrane_threshold / seg_apx
+    try:
+        tomo_sets = discover_tomogram_sets(data_dir, require_tomograms=prepare_review)
+    except (FileNotFoundError, ValueError) as e:
+        typer.echo(f"Input Error: {e}", err=True)
+        raise typer.Exit(code=1)
 
-    typer.echo(f"Scaled particle coordinates (Factor: {scaling_factor:.4f}).")
-    if adaptive_patch_radius:
-        typer.echo(f"Adaptive patch radius on: searching {min_patch_radius:.1f}-{max_patch_radius:.1f} A "
-                   f"({min_patch_radius_vox:.2f}-{max_patch_radius_vox:.2f} voxels) per particle.")
-    else:
-        typer.echo(f"Adaptive patch radius off: fixed patch radius set to {patch_radius_vox:.2f} voxels "
-                   f"({patch_radius} A).")
-    typer.echo(f"Distance-to-membrane plausibility threshold set to {distance_to_membrane_threshold_vox:.2f} "
-               f"voxels ({distance_to_membrane_threshold} A).")
-    typer.echo(f"Angular coverage gap threshold set to {angular_gap_threshold} degrees.")
-    typer.echo(f"Maximum plausible tilt angle set to {max_tilt_angle} degrees.")
+    typer.echo(f"Found {len(tomo_sets)} tomogram(s) to analyze: {[s['stem'] for s in tomo_sets]}")
 
-    typer.echo("Building KD-Tree, extracting patches, and calculating normals...")
-    calculated_angles, calculated_curvatures, calculated_gaps, calculated_radii = compute_all_tilts(
-        particle_coords=particle_coords_vox,
-        eulers=eulers,
-        membrane_coords=membrane_coords_vox,
-        distance_to_membrane_threshold=distance_to_membrane_threshold_vox,
-        angular_gap_threshold=angular_gap_threshold,
-        max_tilt_angle=max_tilt_angle,
-        adaptive_patch_radius=adaptive_patch_radius,
-        patch_radius=patch_radius_vox,
-        min_patch_radius=min_patch_radius_vox,
-        max_patch_radius=max_patch_radius_vox,
-        patch_radius_step=patch_radius_step_vox
+    #deliberately not written into starfiles/ itself - that directory gets glob-scanned as input on
+    #the next run, so writing outputs there would have them show up as (harmlessly skipped, but
+    #noisy) unmatched files every time this is re-run
+    output_dir = data_dir / "tilts_output"
+    output_dir.mkdir(exist_ok=True)
+
+    inputs_dir = None
+    if prepare_review:
+        inputs_dir = data_dir / "gta_review_inputs"
+        inputs_dir.mkdir(exist_ok=True)
+
+    process_one = functools.partial(
+        _process_tomogram_for_analysis, output_dir=output_dir, seg_apx=seg_apx, particles_apx=particles_apx,
+        distance_to_membrane_threshold=distance_to_membrane_threshold,
+        angular_gap_threshold=angular_gap_threshold, max_tilt_angle=max_tilt_angle,
+        adaptive_patch_radius=adaptive_patch_radius, patch_radius=patch_radius,
+        min_patch_radius=min_patch_radius, max_patch_radius=max_patch_radius,
+        prepare_review=prepare_review, inputs_dir=inputs_dir,
     )
+    if workers == 1 or len(tomo_sets) == 1:
+        summaries = [process_one(tomo_set) for tomo_set in tomo_sets]
+    else:
+        typer.echo(f"Analyzing up to {min(workers, len(tomo_sets))} tomogram(s) at a time...")
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            summaries = list(executor.map(process_one, tomo_sets))
 
-    #df is the same object as the relevant entry in df_dict (or df_dict itself, if the STAR file
-    #had no named blocks), so this mutation is already reflected in df_dict - nothing else to write back
-    #row position in the ORIGINAL input STAR file - lets a specific particle (e.g. one flagged during
-    #analysis) be found again later, in this output or in ArtiaX, even after rows have been filtered
-    df['rlnOriginalIndex'] = np.arange(len(df))
-    df['rlnMembraneTiltAngle'] = calculated_angles
-    #negative = convex, membrane bulges toward the particle (expected); positive = concave, membrane
-    #wraps around the particle (implausible pick) - exposed as its own column so it can be inspected
-    #or filtered on directly (e.g. in ArtiaX) rather than only trusting it from the CLI's own diagnostics
-    df['rlnMembraneCurvature'] = calculated_curvatures
-    #widest empty angular sector (degrees) around the particle's patch - recorded for every particle
-    #with a valid patch even if it exceeded --angular-gap-threshold and got excluded, so it's visible
-    #why a given particle's tilt/curvature came back NaN, not just that it did
-    df['rlnAngularCoverageGap'] = calculated_gaps
-    #the patch radius actually used for this particle, in Angstroms - always the fixed --patch_radius
-    #when adaptive selection is off; the radius the search settled on (or fell back to) otherwise
-    df['rlnPatchRadiusUsed'] = np.array(calculated_radii) * seg_apx
+    total_particles = sum(s['n_particles'] for s in summaries)
+    total_accepted = sum(s['n_accepted'] for s in summaries)
+    typer.echo(f"\nDone: {total_accepted}/{total_particles} particles accepted across "
+               f"{len(tomo_sets)} tomogram(s). STAR files saved to {output_dir}.")
 
-    starfile.write(df_dict, output, overwrite=True)
-    typer.echo(f"Success! Analysis complete. Output saved to: {output}")
-
-    #ArtiaX (and similar tools) can't use a NaN column as a selection criterion, so also write a
-    #second STAR file with the outlier/unresolved rows dropped entirely - directly selectable as-is
-    accepted_df = df[df['rlnMembraneTiltAngle'].notna()].copy()
-    accepted_data = {**df_dict, block_name: accepted_df} if block_name is not None else accepted_df
-    accepted_output = output.with_name(f"{output.stem}_accepted_coordinates{output.suffix}")
-
-    starfile.write(accepted_data, accepted_output, overwrite=True)
-    typer.echo(f"Accepted-only particles ({len(accepted_df)}/{len(df)}) saved to: {accepted_output}")
+    if prepare_review:
+        total_images = sum(s['n_review_images'] for s in summaries)
+        typer.echo(f"Prepared {total_images} particle(s) for review under {inputs_dir}.")
+        typer.echo(f"Run `gta review {data_dir}` to triage them.")
 
 #imported for its side effect of registering the `review` command on `app` above - placed here,
 #after `app` is fully defined, to avoid a circular import at module load time
